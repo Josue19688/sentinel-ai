@@ -1,0 +1,57 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Entornos virtuales ────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Variables de entorno — NUNCA al repositorio ───────────────
+.env
+.env.local
+.env.*.local
+
+# ── Modelos ML — artefactos grandes, usar volumen Docker ──────
+ml-service/model_artifacts/
+model_artifacts/
+*.pkl
+*.joblib
+
+# ── Archivos temporales y backups ─────────────────────────────
+*.zip
+*.tar.gz
+*.bak
+*.tmp
+*.swp
+
+# ── IDEs ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Docker ────────────────────────────────────────────────────
+.docker/
+
+# ── Testing y cobertura ───────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -1,0 +1,103 @@
+version: "3.9"
+
+services:
+
+  # ── ML Service API (Inferencia <50ms) ────────────────────────────────────
+  ml-api:
+    build: ./ml-service
+    container_name: sentinel_api
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
+      - REDIS_URL=redis://redis:6379/0
+      - MODEL_MODE=${MODEL_MODE:-DUMMY}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-change-in-prod}
+      - LOG_LEVEL=INFO
+    volumes:
+      - ml_artifacts:/app/model_artifacts
+    depends_on:
+      ml-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Celery Worker (SHAP Asíncrono) ───────────────────────────────────────
+  ml-worker:
+    build: ./ml-service
+    container_name: sentinel_worker
+    command: celery -A app.worker worker --loglevel=info --concurrency=2
+    environment:
+      - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-change-in-prod}
+    depends_on:
+      - ml-db
+      - redis
+    restart: unless-stopped
+
+  # ── ML Feature Store (PostgreSQL + TimescaleDB) ──────────────────────────
+  ml-db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: sentinel_db
+    environment:
+      - POSTGRES_DB=ml_features
+      - POSTGRES_USER=ml
+      - POSTGRES_PASSWORD=ml
+    volumes:
+      - ml_pgdata:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ml -d ml_features" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Redis (Broker Celery) ────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel_redis
+    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Dashboard (Status UI) ────────────────────────────────────────────────
+  dashboard:
+    build: ./ml-service
+    container_name: sentinel_dashboard
+    command: uvicorn app.dashboard:dashboard_app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      - ML_API_URL=http://ml-api:8001
+      - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
+    depends_on:
+      - ml-api
+    restart: unless-stopped
+
+  # ── Simulator (solo en modo testing) ────────────────────────────────────
+  simulator:
+    build: ./simulator
+    container_name: sentinel_simulator
+    environment:
+      - ML_API_URL=http://ml-api:8001
+      - CLIENT_ID=${SIM_CLIENT_ID:-sim-client}
+      - CLIENT_SECRET=${SIM_CLIENT_SECRET:-sim-secret-dev}
+    depends_on:
+      - ml-api
+    profiles:
+      - testing
+
+volumes:
+  ml_pgdata:
+  ml_artifacts:
