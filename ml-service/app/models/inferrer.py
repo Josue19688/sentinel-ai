@@ -10,7 +10,7 @@ from app.normalizers.base import normalize
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)
-FEATURES = ["severity_score", "asset_value", "timestamp_delta", "event_type_id"]
+FEATURES = ["severity_score", "asset_value", "timestamp_delta"]
 
 _model_cache = {"model": None, "scaler": None, "version": None}
 
@@ -61,9 +61,17 @@ def _get_active_artifact_path() -> Optional[str]:
     return f"{base}/{versions[-1]}" if versions else None
 
 
+class DotDict(dict):
+    __getattr__ = dict.get
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
 async def run_inference(raw: dict, client_id: str) -> InferenceResult:
-    # 1. Normalizar el evento
-    event = normalize(raw)
+    # 1. Compatibilidad: Gateway v2 (enriched dict) vs direct ingestion
+    if "features_vector" in raw and "asset_id" in raw:
+        event = DotDict(raw)
+    else:
+        event = normalize(raw)
 
     # 2. Modo DUMMY — solo valida conectividad
     if settings.MODEL_MODE == "DUMMY":

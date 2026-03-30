@@ -11,10 +11,11 @@ services:
     environment:
       - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
       - REDIS_URL=redis://redis:6379/0
-      - MODEL_MODE=${MODEL_MODE:-DUMMY}
+      - MODEL_MODE=${MODEL_MODE:-SHADOW}
       - SECRET_KEY=${SECRET_KEY:-dev-secret-change-in-prod}
       - LOG_LEVEL=INFO
     volumes:
+      - ./ml-service:/app
       - ml_artifacts:/app/model_artifacts
     depends_on:
       ml-db:
@@ -37,6 +38,9 @@ services:
       - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
       - REDIS_URL=redis://redis:6379/0
       - SECRET_KEY=${SECRET_KEY:-dev-secret-change-in-prod}
+    volumes:
+      - ./ml-service:/app
+      - ml_artifacts:/app/model_artifacts
     depends_on:
       - ml-db
       - redis
@@ -81,6 +85,8 @@ services:
     environment:
       - ML_API_URL=http://ml-api:8001
       - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
+    volumes:
+      - ./ml-service:/app
     depends_on:
       - ml-api
     restart: unless-stopped

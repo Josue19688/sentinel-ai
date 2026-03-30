@@ -12,8 +12,9 @@ from app.gateway.normalizer    import auto_normalize
 from app.gateway.enricher      import enrich
 from app.gateway.correlator    import correlate
 from app.gateway.grc_forwarder import forward_to_grc
+from app.worker import celery
 from app.gateway.store         import save_client_config, get_client_config
-from app.db import get_db_conn
+from app.db import get_db_conn, get_redis
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gateway", tags=["gateway"])
@@ -93,15 +94,51 @@ async def analyze(request: Request):
 
     # 4. Enriquecimiento automático — threat intelligence, geolocalización
     enriched = await enrich(normalized)
+    enriched["sentinel_key"] = client["sentinel_key"]
+
+    # 4.1. Persistencia asíncrona — Enviar a Redis para Bulk Store (Fase 1)
+    try:
+        redis_client = await get_redis()
+        # Guardamos el evento normalizado completo para el entrenamiento
+        await redis_client.lpush("sentinel:ingest_queue", json.dumps(enriched))
+        
+        # Trigger automático de la tarea de guardado masivo en el Worker
+        celery.send_task("process_ingest_queue")
+    except Exception as e:
+        logger.error(f"Error enviando a Redis ingest_queue o trigger: {e}")
 
     # 5. Correlación multi-fuente en ventana de 6 minutos
     correlation = await correlate(enriched, client["sentinel_key"])
 
+    # 5.5 INFERENCIA ML EN TIEMPO REAL (Fase 4 MLSecOps)
+    from app.models.inferrer import run_inference
+    try:
+        inference_result = await run_inference(enriched, client["sentinel_key"])
+        logger.info(f"[{client['company_name']}] ML Anomaly Score: {inference_result.anomaly_score:.3f}")
+        # Encolar el cálculo de SHAP si se generó una recomendación (anomalía detectada o modo shadow)
+        if inference_result.recommendation_id:
+            celery.send_task("compute_shap", args=[inference_result.recommendation_id])
+    except Exception as e:
+        logger.error(f"Error en inferencia ML para {enriched.get('asset_id')}: {e}")
+
     # 6. Construir resultado en lenguaje humano
     result = _build_result(enriched, correlation)
 
-    # 7. Reenviar al GRC del cliente automáticamente
-    grc_response = await forward_to_grc(client, result, raw)
+    # 7. Reenviar al GRC con Anti-Saturación (1 alerta x minuto por activo/patrón)
+    if result["risk_level"] in ["high", "medium"]:
+        # Evitamos saturar el GRC con ráfagas: comprobamos en Redis si ya avisamos hace poco
+        lock_key = f"grc_lock:{api_key}:{enriched['asset_id']}:{result['pattern']}"
+        already_sent = await redis_client.get(lock_key)
+        
+        if not already_sent:
+            # Marcamos que ya enviamos esta (expira en 60 segundos)
+            await redis_client.setex(lock_key, 60, "sent")
+            grc_response = await forward_to_grc(client, result, enriched)
+            logger.info(f"[{client['company_name']}] GRC: Alerta enviada (Deduplicación activa)")
+        else:
+            grc_response = {"status": "suppressed", "message": "Alert suppressed by rate-limiter (Deduplication)."}
+    else:
+        grc_response = {"status": "filtered", "message": f"Low risk alert ({result['risk_level']}) filtered locally."}
 
     latency = (time.perf_counter() - t0) * 1000
     logger.info(f"[{client['company_name']}] Procesado en {latency:.1f}ms — nivel: {result['risk_level']}")

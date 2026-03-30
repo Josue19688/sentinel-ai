@@ -10,6 +10,11 @@ build/
 *.egg
 .eggs/
 
+# ── Archivos locales con credenciales — NUNCA al repositorio ──
+nosubir.py
+nosubir*.py
+*credentials*.py
+
 # ── Entornos virtuales ────────────────────────────────────────
 .venv/
 venv/
@@ -55,3 +60,34 @@ logs/
 # ── OS ────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ── Exportaciones y Dumps Locales ─────────────────────────────
+*.sql
+dump.rdb
+*.sqlite3
+
+# ── Certificados TLS y Secretos en texto plano ────────────────
+*.pem
+*.key
+*.crt
+*.cert
+secrets.json
+.secrets/
+
+# ── Carpetas privadas del Agente local ────────────────────────
+.gemini/
+
+# ── Scripts Privados y Migraciones de Base de Datos ───────────
+scripts/
+alembic/
+migrations/
+
+# ── Documentación Privada y Herramientas ──────────────────────
+Documentacion necesaria/
+documentacion-*.md
+plan_mitigacion*.md
+generate_doc.js
+
+# ── Testing ───────────────────────────────────────────────────
+tests/
+ml-service/tests/

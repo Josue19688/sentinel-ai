@@ -1,11 +1,12 @@
 """
 Conexión a PostgreSQL — pool asyncpg compartido.
 """
-import asyncpg
+import asyncpg, redis.asyncio as redis
 from contextlib import asynccontextmanager
 from app.config import settings
 
 _pool = None
+_redis = None
 
 
 async def get_pool():
@@ -18,6 +19,13 @@ async def get_pool():
             command_timeout=30
         )
     return _pool
+
+
+async def get_redis():
+    global _redis
+    if _redis is None:
+        _redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return _redis
 
 
 @asynccontextmanager

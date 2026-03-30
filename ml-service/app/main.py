@@ -40,6 +40,9 @@ app = FastAPI(
 app.include_router(router)
 app.include_router(gateway_router)
 
+from app.api.trainer_routes import router as trainer_router
+app.include_router(trainer_router)
+
 
 @app.get("/health")
 async def health():

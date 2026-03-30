@@ -19,9 +19,9 @@ Uso:
 import sys, json, requests
 
 # ── CONFIGURACIÓN (solo esto necesitas cambiar) ──────────────
-SENTINEL_URL    = "https://tu-sentinel.ejemplo.com"
-SENTINEL_KEY    = "snl_XXXXX"   # generado por Sentinel al registrarte
-SENTINEL_SECRET = "XXXXX"       # generado por Sentinel al registrarte
+SENTINEL_URL    = "http://localhost:8001"
+SENTINEL_KEY    = "snl_test"   # generado por Sentinel al registrarte
+SENTINEL_SECRET = "test"       # generado por Sentinel al registrarte
 # ─────────────────────────────────────────────────────────────
 
 ENDPOINT = f"{SENTINEL_URL}/gateway/analyze"
