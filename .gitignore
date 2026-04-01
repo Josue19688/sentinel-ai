@@ -91,3 +91,18 @@ generate_doc.js
 # ── Testing ───────────────────────────────────────────────────
 tests/
 ml-service/tests/
+
+# ── Local Debug, Sandbox and Extracts (Sentinel ML v2.0) ──────
+debug_sandbox*.py
+extract.txt
+*debug*.txt
+*sandbox*.txt
+*.jsonl
+*debug*.py
+sentinel_test_suite.py
+stress-testing.py
+
+# ── Local Docs (Except README & Core Project Plan) ───────────
+*.md
+!README.md
+!plan_mitigacion_sentinel_ml.md

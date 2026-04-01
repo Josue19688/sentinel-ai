@@ -24,7 +24,7 @@ async def render_dashboard():
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="10">
+  <meta http-equiv="refresh" content="1200">
   <title>Sentinel ML — Dashboard</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -48,11 +48,18 @@ async def render_dashboard():
     .mode-shadow {{ color: #fbbf24; }}
     .mode-live  {{ color: #4ade80; }}
     .footer {{ margin-top: 2rem; color: #334155; font-size: 0.75rem; text-align: center; }}
+    .sandbox-container {{ margin-top: 3rem; background: #1e2330; padding: 1.5rem; border-radius: 10px; border: 1px solid #2d3748; }}
+    .sandbox-container h2 {{ color: #818cf8; font-size: 1.25rem; margin-bottom: 0.5rem; }}
+    .sandbox-container input {{ padding: 0.5rem; background: #0f1117; color: white; border: 1px solid #475569; border-radius: 5px; margin-right: 1rem; }}
+    .sandbox-container button {{ padding: 0.5rem 1rem; background: #2563eb; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; transition: background 0.2s; }}
+    .sandbox-container button:hover {{ background: #1d4ed8; }}
+    .sandbox-container .status {{ margin-top: 1rem; color: #fbbf24; font-size: 0.85rem; font-weight: bold; }}
+    .sandbox-container pre {{ margin-top: 1rem; background: #0f1117; padding: 1rem; border-radius: 5px; color: #a5b4fc; overflow-x: auto; font-size: 0.85rem; font-family: monospace; border: 1px dashed #475569; min-height: 100px; }}
   </style>
 </head>
 <body>
-  <h1>Sentinel ML Service</h1>
-  <p class="subtitle">Motor de detección de anomalías — actualiza cada 10s</p>
+  <h1>GRC ML Service</h1>
+  <p class="subtitle">Motor de detección de anomalías — actualiza cada 20 minutos.</p>
 
   <div class="grid">
     <div class="card">
@@ -96,7 +103,52 @@ async def render_dashboard():
     </tbody>
   </table>
 
-  <p class="footer">Sentinel ML Service v1.0 — ISO 27001 / 42001 — Modo: {stats['mode']}</p>
+  <div class="sandbox-container">
+    <h2>🧪 Laboratorio Forense (Sandbox Tester UI)</h2>
+    <p class="subtitle" style="margin-bottom:1rem;">Prueba la subida de un JSON o JSONL crudo al Motor Agnóstico. Devuelve métricas financieras sin procesar.</p>
+    <input type="file" id="sandboxFile" accept=".json,.jsonl" />
+    <button onclick="testSandbox()">Procesar Archivo</button>
+    <div class="status" id="testStatus">Esperando archivo...</div>
+    <pre id="sandboxResult">AQUÍ APARECERÁ EL JSON PURO DEL RESULTADO ISO 27005...</pre>
+  </div>
+
+  <p class="footer">GRC ML Service v1.0 — ISO 27001 / 42001 — Modo: {stats['mode']}</p>
+  
+  <script>
+  async function testSandbox() {{
+      const fileInput = document.getElementById('sandboxFile');
+      if (!fileInput.files.length) return alert('Selecciona un archivo json o jsonl');
+      
+      document.getElementById('testStatus').innerText = '⏳ Subiendo archivo por Multipart (Paso 1/2)...';
+      document.getElementById('sandboxResult').innerText = '';
+      
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      formData.append('allow_telemetry_training', 'true');
+      
+      try {{
+          const urlGateway = 'http://localhost:8001/gateway/sandbox';
+          let res = await fetch(urlGateway, {{ method: 'POST', body: formData }});
+          if (!res.ok) throw new Error("Fallo al subir archivo. HTTP " + res.status);
+          
+          let data = await res.json();
+          const sessionId = data.session_id;
+          
+          document.getElementById('testStatus').innerText = `✅ ¡Ingesta exitosa! Dispacheado al Celery Worker (Session ID: ${{sessionId}})\n🧠 Calculando IsolationForest (Esperando 3s)...`;
+          
+          setTimeout(async () => {{
+              document.getElementById('testStatus').innerText = `🧠 Solicitando Pipeline Híbrido al backend...`;
+              let resPol = await fetch(urlGateway + '/' + sessionId);
+              let finalData = await resPol.json();
+              document.getElementById('testStatus').innerText = `✅ Evaluación Financiera (ALE) y Geométrica Completada`;
+              document.getElementById('sandboxResult').innerText = JSON.stringify(finalData, null, 2);
+          }}, 3000);
+          
+      }} catch(err) {{
+          document.getElementById('testStatus').innerText = '❌ Error de Conexión: ' + err.message;
+      }}
+  }}
+  </script>
 </body>
 </html>"""
     return HTMLResponse(html)

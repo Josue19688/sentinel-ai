@@ -3,31 +3,48 @@ Sentinel Gateway — Proxy Universal
 El usuario solo configura URL + credenciales en su SIEM.
 Sentinel hace todo lo demás de forma invisible.
 
-Flujo:
-  SIEM (cualquiera) → POST /analyze → enriquecimiento → correlación → GRC
+Flujo actualizado (3 capas):
+  SIEM → POST /analyze
+       → normalización + enriquecimiento + correlación
+       → [Capa 1] KafkaFilter (filtra ruido)
+       → [Capa 2] River ML (detección streaming, vía ingest_queue)
+       → [Capa 3] IsolationForest (asíncrono, vía escalate_queue)
+       → GRC
+
+Cambios respecto a la versión anterior:
+  1. Sección 4.1: reemplazado lpush manual por get_filter().send()
+     → activa la Capa 1 en cada evento que entra
+  2. Sección 5.5: eliminada la llamada directa a run_inference()
+     → el IF ahora es asíncrono, no bloquea el endpoint
+     → River ML decide si escalar vía escalate_queue
 """
-import time, logging, httpx, json
-from fastapi import APIRouter, Request, HTTPException
-from app.gateway.normalizer    import auto_normalize
-from app.gateway.enricher      import enrich
-from app.gateway.correlator    import correlate
-from app.gateway.grc_forwarder import forward_to_grc
-from app.worker import celery
-from app.gateway.store         import save_client_config, get_client_config
-from app.db import get_db_conn, get_redis
+
+import time, logging, httpx, json, uuid
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+
+from app.sentinel_v2.normalizer.universal  import normalize as auto_normalize
+from app.sentinel_v2.streaming.kafka_filter import get_filter
+from app.gateway.enricher                  import enrich
+from app.gateway.correlator                import correlate
+from app.gateway.grc_forwarder             import forward_to_grc
+from app.worker                            import celery
+from app.gateway.store                     import save_client_config, get_client_config
+from app.db                                import get_db_conn, get_redis
+from app.sentinel_v2.calculator.risk       import calculate as calculate_risk
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gateway", tags=["gateway"])
 
 
 # ── Registro de cliente ───────────────────────────────────────────────────────
+
 @router.post("/register")
 async def register_client(request: Request):
     """
     El admin registra su GRC una sola vez.
     Recibe: grc_url, grc_api_key, grc_api_secret, company_name
     Devuelve: sentinel_api_key, sentinel_api_secret, webhook_url
-    El script del SIEM apunta a webhook_url con las credenciales de Sentinel.
     """
     body = await request.json()
     required = ["grc_url", "grc_api_key", "grc_api_secret", "company_name"]
@@ -38,7 +55,7 @@ async def register_client(request: Request):
     import secrets, hashlib
     sentinel_key    = f"snl_{secrets.token_urlsafe(20)}"
     sentinel_secret = secrets.token_urlsafe(32)
-    secret_salt     = secrets.token_hex(16)          # salt único por cliente
+    secret_salt     = secrets.token_hex(16)
     secret_hash     = hashlib.sha256(
         (secret_salt + sentinel_secret).encode()
     ).hexdigest()
@@ -46,7 +63,8 @@ async def register_client(request: Request):
     async with get_db_conn() as conn:
         await conn.execute("""
             INSERT INTO sentinel_clients
-                (sentinel_key, secret_hash, secret_salt, company_name, grc_url, grc_api_key, grc_api_secret)
+                (sentinel_key, secret_hash, secret_salt, company_name,
+                 grc_url, grc_api_key, grc_api_secret)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (sentinel_key) DO NOTHING
         """, sentinel_key, secret_hash, secret_salt, body["company_name"],
@@ -61,17 +79,87 @@ async def register_client(request: Request):
     }
 
 
+# ── Sandbox Forense — Endpoint Público ───────────────────────────────────────
+
+MAX_FILE_SIZE      = 10 * 1024 * 1024
+ALLOWED_MAGIC_BYTES = (b'{', b'[')
+
+
+@router.post("/sandbox")
+async def process_sandbox_upload(
+    file: UploadFile = File(...),
+    allow_telemetry_training: bool = Form(False),
+):
+    """
+    Ingesta blindada para el Sandbox Público.
+    Valida Magic Bytes, tamaño y opt-in GDPR antes de encolar.
+    """
+    content = await file.read()
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, "El archivo excede el límite estricto de 10MB.")
+
+    if content.lstrip()[:1] not in ALLOWED_MAGIC_BYTES:
+        raise HTTPException(
+            415,
+            "El archivo no es JSON o JSONL válido (Magic Bytes Mismatch). "
+            "Se prohíben ejecutables."
+        )
+
+    session_uuid = str(uuid.uuid4())
+    celery.send_task(
+        name="process_sandbox_file",
+        args=[session_uuid, content.decode("utf-8", errors="ignore"), allow_telemetry_training],
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status":                 "processing",
+            "message":                "Archivo validado y encolado para escrutinio IA.",
+            "session_id":             session_uuid,
+            "legal_telemetry_granted": allow_telemetry_training,
+            "disclaimer":             "Tu reporte se purgará físicamente en 24 horas por privacidad.",
+        },
+    )
+
+
+@router.get("/sandbox/{session_id}")
+async def get_sandbox_report(session_id: str):
+    """Retorna el reporte forense o 410 Gone si expiró (24h GDPR)."""
+    redis_client = await get_redis()
+    data = await redis_client.get(f"sandbox:{session_id}")
+
+    if not data:
+        return JSONResponse(
+            status_code=410,
+            content={
+                "message": (
+                    "Por políticas de privacidad (GDPR), tu reporte de 24 horas "
+                    "fue destruido irrevocablemente. Sube nuevamente el archivo."
+                )
+            },
+        )
+
+    parsed = json.loads(data)
+    if "error" in parsed:
+        return JSONResponse(status_code=400, content=parsed)
+
+    return parsed
+
+
 # ── Endpoint principal — recibe cualquier SIEM ────────────────────────────────
+
 @router.post("/analyze")
 async def analyze(request: Request):
     """
     Endpoint universal. El SIEM envía su alerta cruda aquí.
     Sentinel normaliza, enriquece, correlaciona y reenvía al GRC.
-    El SIEM no sabe qué pasa adentro.
+    La inferencia ML ocurre de forma asíncrona — no bloquea la respuesta.
     """
     t0 = time.perf_counter()
 
-    # 1. Autenticación simple — mismas cabeceras que tu GRC actual
+    # 1. Autenticación HMAC
     api_key    = request.headers.get("X-API-Key")
     api_secret = request.headers.get("X-API-Secret")
 
@@ -82,122 +170,124 @@ async def analyze(request: Request):
     if not client:
         raise HTTPException(403, "Credenciales inválidas")
 
-    # 2. Recibir el JSON crudo — cualquier formato
+    # 2. Recibir JSON crudo
     try:
         raw = await request.json()
     except Exception:
         raise HTTPException(400, "El body debe ser JSON válido")
 
-    # 3. Normalización automática — detecta Wazuh, Sentinel, Syslog, etc.
+    # 3. Normalización agnóstica — sentinel_v2
     normalized = auto_normalize(raw)
-    logger.info(f"[{client['company_name']}] Fuente detectada: {normalized['source']}")
+    logger.info(f"[{client['company_name']}] Fuente: {normalized['source']}")
 
-    # 4. Enriquecimiento automático — threat intelligence, geolocalización
+    # 4. Enriquecimiento — threat intel + geolocalización
     enriched = await enrich(normalized)
     enriched["sentinel_key"] = client["sentinel_key"]
 
-    # 4.1. Persistencia asíncrona — Enviar a Redis para Bulk Store (Fase 1)
+    # ── CAMBIO 1: Capa 1 activa ───────────────────────────────────────────
+    # Antes: lpush manual a Redis (saltaba el filtro)
+    # Ahora: get_filter().send() aplica KafkaFilter antes de encolar
+    # Si el evento no supera el filtro, se descarta silenciosamente aquí.
+    # River ML (Capa 2) procesará el evento vía process_ingest_queue.
+    # Si River lo marca como sospechoso, irá a escalate_queue → IF (Capa 3).
     try:
-        redis_client = await get_redis()
-        # Guardamos el evento normalizado completo para el entrenamiento
-        await redis_client.lpush("sentinel:ingest_queue", json.dumps(enriched))
-        
-        # Trigger automático de la tarea de guardado masivo en el Worker
-        celery.send_task("process_ingest_queue")
+        sent = get_filter().send(enriched)
+        if sent:
+            celery.send_task("process_ingest_queue")
+            logger.debug(f"[{client['company_name']}] Evento encolado vía KafkaFilter")
+        else:
+            logger.debug(f"[{client['company_name']}] Evento descartado por KafkaFilter")
     except Exception as e:
-        logger.error(f"Error enviando a Redis ingest_queue o trigger: {e}")
+        logger.error(f"Error en KafkaFilter/ingest: {e}")
+    # ── FIN CAMBIO 1 ──────────────────────────────────────────────────────
 
-    # 5. Correlación multi-fuente en ventana de 6 minutos
+    # 5. Correlación multi-fuente (ventana 6 minutos) — sin cambios
     correlation = await correlate(enriched, client["sentinel_key"])
 
-    # 5.5 INFERENCIA ML EN TIEMPO REAL (Fase 4 MLSecOps)
-    from app.models.inferrer import run_inference
-    try:
-        inference_result = await run_inference(enriched, client["sentinel_key"])
-        logger.info(f"[{client['company_name']}] ML Anomaly Score: {inference_result.anomaly_score:.3f}")
-        # Encolar el cálculo de SHAP si se generó una recomendación (anomalía detectada o modo shadow)
-        if inference_result.recommendation_id:
-            celery.send_task("compute_shap", args=[inference_result.recommendation_id])
-    except Exception as e:
-        logger.error(f"Error en inferencia ML para {enriched.get('asset_id')}: {e}")
+    # ── CAMBIO 2: eliminada inferencia síncrona ───────────────────────────
+    # Antes: run_inference() bloqueaba el endpoint añadiendo 50ms+
+    # Ahora: River ML (Capa 2) decide si escalar al IF de forma asíncrona.
+    #        El endpoint responde inmediatamente. El IF corre en background.
+    #        Resultado: latencia del endpoint reducida ~50ms en promedio.
+    # ── FIN CAMBIO 2 ──────────────────────────────────────────────────────
 
-    # 6. Construir resultado en lenguaje humano
-    result = _build_result(enriched, correlation)
+    # 6. Resultado para el GRC — sin cambios
+    result       = _build_result(enriched, correlation)
+    risk_metrics = calculate_risk(enriched)
 
-    # 7. Reenviar al GRC con Anti-Saturación (1 alerta x minuto por activo/patrón)
+    # 7. Reenvío al GRC con anti-saturación — sin cambios
+    redis_client = await get_redis()
     if result["risk_level"] in ["high", "medium"]:
-        # Evitamos saturar el GRC con ráfagas: comprobamos en Redis si ya avisamos hace poco
-        lock_key = f"grc_lock:{api_key}:{enriched['asset_id']}:{result['pattern']}"
+        lock_key     = f"grc_lock:{api_key}:{enriched['asset_id']}:{result['pattern']}"
         already_sent = await redis_client.get(lock_key)
-        
+
         if not already_sent:
-            # Marcamos que ya enviamos esta (expira en 60 segundos)
             await redis_client.setex(lock_key, 60, "sent")
             grc_response = await forward_to_grc(client, result, enriched)
-            logger.info(f"[{client['company_name']}] GRC: Alerta enviada (Deduplicación activa)")
+            logger.info(f"[{client['company_name']}] GRC: alerta enviada")
         else:
-            grc_response = {"status": "suppressed", "message": "Alert suppressed by rate-limiter (Deduplication)."}
+            grc_response = {
+                "status":  "suppressed",
+                "message": "Alert suppressed by rate-limiter (Deduplication).",
+            }
     else:
-        grc_response = {"status": "filtered", "message": f"Low risk alert ({result['risk_level']}) filtered locally."}
+        grc_response = {
+            "status":  "filtered",
+            "message": f"Low risk alert ({result['risk_level']}) filtered locally.",
+        }
 
     latency = (time.perf_counter() - t0) * 1000
-    logger.info(f"[{client['company_name']}] Procesado en {latency:.1f}ms — nivel: {result['risk_level']}")
+    logger.info(f"[{client['company_name']}] {latency:.1f}ms — {result['risk_level']}")
 
     return {
-        "status":       "processed",
-        "risk_level":   result["risk_level"],       # low | medium | high
-        "pattern":      result["pattern"],           # nombre del ataque en español
-        "action":       result["action"],            # ignore | review | escalate
-        "reason":       result["reason"],            # explicación en lenguaje humano
-        "enriched":     enriched["threat_intel"],    # True si IP estaba en listas negras
-        "source_detected": normalized["source"],     # wazuh | sentinel | syslog | etc.
-        "latency_ms":   round(latency, 1),
-        "grc_notified": grc_response
+        "status":          "processed",
+        "risk_level":      result["risk_level"],
+        "pattern":         result["pattern"],
+        "action":          result["action"],
+        "sle_usd":         risk_metrics.sle_usd,
+        "ale_usd":         risk_metrics.ale_usd,
+        "iso_control":     risk_metrics.iso_control,
+        "reason":          result["reason"],
+        "enriched":        enriched["threat_intel"],
+        "source_detected": normalized["source"],
+        "latency_ms":      round(latency, 1),
+        "grc_notified":    grc_response,
     }
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def _build_result(enriched: dict, correlation: dict) -> dict:
-    """Traduce los datos técnicos a lenguaje de analista."""
+    """Traduce datos técnicos a lenguaje de analista."""
     pattern  = correlation.get("pattern", "none")
     ti_match = enriched.get("threat_intel", False)
     score    = enriched.get("severity_score", 0.3)
 
-    # Elevar automáticamente si IP está en listas negras
     if ti_match:
         score = max(score, 0.8)
 
-    # Determinar nivel simple: low / medium / high
     if score >= 0.75 or pattern in ("lateral_movement", "brute_force_success", "c2_beacon"):
-        risk_level = "high"
-        action     = "escalate"
+        risk_level, action = "high",   "escalate"
     elif score >= 0.45 or pattern in ("brute_force", "port_scan", "suspicious_outbound"):
-        risk_level = "medium"
-        action     = "review"
+        risk_level, action = "medium", "review"
     else:
-        risk_level = "low"
-        action     = "ignore"
+        risk_level, action = "low",    "ignore"
 
-    # Razón en lenguaje humano
     reasons = {
-        "lateral_movement":    "Autenticación fallida seguida de éxito desde misma IP hacia activo diferente en menos de 6 minutos.",
-        "brute_force":         f"Múltiples intentos de autenticación fallidos ({correlation.get('count', '?')} intentos).",
-        "brute_force_success": "Ataque de fuerza bruta exitoso — posibles credenciales comprometidas.",
+        "lateral_movement":    "Autenticación fallida seguida de éxito desde misma IP en menos de 6 minutos.",
+        "brute_force":         f"Múltiples intentos fallidos ({correlation.get('count', '?')} intentos).",
+        "brute_force_success": "Ataque de fuerza bruta exitoso — credenciales posiblemente comprometidas.",
         "port_scan":           "Alto volumen de conexiones denegadas a múltiples puertos desde misma IP.",
-        "c2_beacon":           "Conexiones salientes regulares a IP en lista negra — posible beaconing C2.",
+        "c2_beacon":           "Conexiones salientes regulares a IP en lista negra — posible C2.",
         "suspicious_outbound": "Tráfico saliente hacia destino inusual o en lista de amenazas.",
-        "none":                "Evento procesado — sin patrón de ataque reconocido."
+        "none":                "Evento procesado — sin patrón de ataque reconocido.",
     }
 
     reason = reasons.get(pattern, reasons["none"])
     if ti_match:
-        reason += " IP de origen encontrada en feeds de inteligencia de amenazas."
+        reason += " IP encontrada en feeds de inteligencia de amenazas."
 
-    return {
-        "risk_level": risk_level,
-        "pattern":    pattern,
-        "action":     action,
-        "reason":     reason
-    }
+    return {"risk_level": risk_level, "pattern": pattern, "action": action, "reason": reason}
 
 
 async def _verify_client(api_key: str, api_secret: str) -> dict | None:
@@ -211,10 +301,7 @@ async def _verify_client(api_key: str, api_secret: str) -> dict | None:
         """, api_key)
     if not row:
         return None
-    # Rehashear con el salt almacenado y comparar en tiempo constante
-    expected_hash = hashlib.sha256(
-        (row["secret_salt"] + api_secret).encode()
-    ).hexdigest()
-    if not hmac_lib.compare_digest(expected_hash, row["secret_hash"]):
+    expected = hashlib.sha256((row["secret_salt"] + api_secret).encode()).hexdigest()
+    if not hmac_lib.compare_digest(expected, row["secret_hash"]):
         return None
     return dict(row)

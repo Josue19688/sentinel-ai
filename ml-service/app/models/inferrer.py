@@ -6,7 +6,7 @@ import pickle, hashlib, os, time, logging, numpy as np
 from typing import Optional
 from pydantic import BaseModel
 from app.config import settings
-from app.normalizers.base import normalize
+from app.sentinel_v2.normalizer.universal import normalize
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     if "features_vector" in raw and "asset_id" in raw:
         event = DotDict(raw)
     else:
-        event = normalize(raw)
+        event = DotDict(normalize(raw))
 
     # 2. Modo DUMMY — solo valida conectividad
     if settings.MODEL_MODE == "DUMMY":

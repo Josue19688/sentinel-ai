@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -12,6 +13,10 @@ class Settings(BaseSettings):
     RETENTION_DAYS: int = 90
     MODEL_ARTIFACTS_PATH: str = "/app/model_artifacts"
     ABUSEIPDB_API_KEY: str = ""             # vacío = deshabilitado; configurar en .env para producción
+    
+    # Ingestión (Capa 1)
+    KAFKA_BROKER_URL: Optional[str] = None
+    KAFKA_INGEST_TOPIC: str = "sentinel.ingest"
 
     model_config = SettingsConfigDict(
         env_file=".env",
