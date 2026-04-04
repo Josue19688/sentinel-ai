@@ -14,6 +14,7 @@ services:
       - MODEL_MODE=${MODEL_MODE:-SHADOW}
       - SECRET_KEY=${SECRET_KEY:-dev-secret-change-in-prod}
       - LOG_LEVEL=INFO
+      - APP_ENV=${APP_ENV:-DEVELOPMENT}
     volumes:
       - ./ml-service:/app
       - ml_artifacts:/app/model_artifacts
@@ -28,6 +29,9 @@ services:
       timeout: 10s
       retries: 3
     restart: unless-stopped
+    networks:
+      - default
+      - backend_default
 
   # ── Celery Worker (SHAP Asíncrono) ───────────────────────────────────────
   ml-worker:
@@ -38,6 +42,7 @@ services:
       - DATABASE_URL=postgresql://ml:ml@ml-db:5432/ml_features
       - REDIS_URL=redis://redis:6379/0
       - SECRET_KEY=${SECRET_KEY:-dev-secret-change-in-prod}
+      - APP_ENV=${APP_ENV:-DEVELOPMENT}
     volumes:
       - ./ml-service:/app
       - ml_artifacts:/app/model_artifacts
@@ -45,6 +50,9 @@ services:
       - ml-db
       - redis
     restart: unless-stopped
+    networks:
+      - default
+      - backend_default
 
   # ── ML Feature Store (PostgreSQL + TimescaleDB) ──────────────────────────
   ml-db:
@@ -68,7 +76,12 @@ services:
   redis:
     image: redis:7-alpine
     container_name: sentinel_redis
-    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
@@ -103,6 +116,10 @@ services:
       - ml-api
     profiles:
       - testing
+
+networks:
+  backend_default:
+    external: true
 
 volumes:
   ml_pgdata:

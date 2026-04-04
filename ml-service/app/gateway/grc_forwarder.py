@@ -34,6 +34,13 @@ async def forward_to_grc(client: dict, result: dict, normalized: dict) -> bool:
     api_key    = client.get("grc_api_key")
     api_secret = client.get("grc_api_secret")
 
+    # ── Redirección de Laboratorio ──────────────────────────────────────────
+    if settings.APP_ENV == "DEVELOPMENT" and settings.DEV_GRC_URL:
+        logger.info(f"[LAB_MODE] Usando llave: {api_key[:4]}... en GRC: {settings.DEV_GRC_URL}")
+        grc_url = settings.DEV_GRC_URL
+        api_key = settings.DEV_GRC_API_KEY
+        api_secret = settings.DEV_GRC_API_SECRET
+    
     if not grc_url:
         return False
 
@@ -128,8 +135,10 @@ async def _send_to_grc(
     """
     Envía el payload al GRC forzando HTTPS y manejando redirecciones.
     """
-    # Forzar HTTPS para evitar 301 y asegurar canal cifrado
-    base_url = str(grc_url).replace("http://", "https://")
+    # Forzar HTTPS solo en producción; en laboratorio respetar el esquema (http/https)
+    base_url = str(grc_url)
+    if settings.APP_ENV != "DEVELOPMENT":
+        base_url = base_url.replace("http://", "https://")
     endpoint = f"{base_url.rstrip('/')}/api/v1/integrations/telemetry"
 
     headers = {
@@ -138,6 +147,10 @@ async def _send_to_grc(
         "Content-Type":   "application/json",
         "X-Forwarded-By": "Sentinel-ML/2.0",
     }
+
+    # Lab Fix: Forzar host con puerto para evitar 400 Bad Request
+    if settings.APP_ENV == "DEVELOPMENT":
+        headers["Host"] = "localhost:8000"
 
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as http:

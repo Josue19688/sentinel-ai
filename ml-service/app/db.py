@@ -11,6 +11,15 @@ _redis = None
 
 async def get_pool():
     global _pool
+    # Si el pool existe pero su loop se cerró (común en Celery con asyncio.run)
+    # reseteamos el pool global para que se cree uno nuevo en el loop actual.
+    if _pool is not None:
+        try:
+            if _pool._loop.is_closed():
+                _pool = None
+        except Exception:
+            _pool = None
+
     if _pool is None:
         _pool = await asyncpg.create_pool(
             settings.DATABASE_URL,
@@ -26,6 +35,7 @@ async def get_redis():
     if _redis is None:
         _redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
     return _redis
+
 
 
 @asynccontextmanager

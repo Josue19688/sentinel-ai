@@ -1,4 +1,4 @@
-﻿"""
+"""
 normalizer/universal.py
 ========================
 Responsabilidad ÃšNICA: orquestar el pipeline de normalizaciÃ³n.
@@ -60,6 +60,9 @@ def _pipeline(raw: dict) -> dict:
         str(extracted.get("command") or ""),
         json.dumps(clean),  # incluir el objeto completo para no perder contexto
     ]))
+    # Diagnostic log to analyze pattern:none cases
+    logger.info(f"DEBUG_CLASSIFY_TEXT: {classify_text[:500]}...")
+
     pattern_result = classify(
         text           = classify_text,
         severity_score = extracted["severity_score"],

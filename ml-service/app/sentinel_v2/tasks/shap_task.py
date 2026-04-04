@@ -28,7 +28,12 @@ from app.sentinel_v2.worker.db         import get_sync_conn, load_model_sync
 
 logger = logging.getLogger(__name__)
 
-FEATURES = ["severity_score", "asset_value", "timestamp_delta"]
+FEATURES = ["severity", "asset_val", "delta"]
+FEATURE_KEYS = {
+    "severity": "severity_score",
+    "asset_val": "asset_value",
+    "delta": "timestamp_delta",
+}
 
 
 # ── Tarea Celery ──────────────────────────────────────────────────────────────
@@ -74,7 +79,8 @@ def _compute_and_store(recommendation_id: str) -> None:
             return
 
         # 4. Calcular SHAP
-        vec        = np.array([[fv.get(f, 0.0) for f in FEATURES]])
+        import pandas as pd
+        vec        = pd.DataFrame([[fv.get(FEATURE_KEYS[f], 0.0) for f in FEATURES]], columns=FEATURES)
         vec_scaled = scaler.transform(vec)
         shap_dict  = _calculate_shap(model, vec_scaled, fv)
 
@@ -150,24 +156,24 @@ def _approximate_shap(fv: dict) -> dict:
     a su valor neutral (0.5 para scores, 300 para timestamp_delta).
     """
     return {
-        "severity_score":  round((fv.get("severity_score", 0.5) - 0.5) * 0.6, 4),
-        "asset_value":     round((fv.get("asset_value", 0.5) - 0.5) * 0.2, 4),
-        "timestamp_delta": round(-fv.get("timestamp_delta", 300) / 10_000, 4),
+        "severity":  round((fv.get("severity_score", 0.5) - 0.5) * 0.6, 4),
+        "asset_val": round((fv.get("asset_value", 0.5) - 0.5) * 0.2, 4),
+        "delta":     round(-fv.get("timestamp_delta", 300) / 10_000, 4),
     }
 
 
 def _explain_top_feature(top_feature: str, fv: dict) -> str:
     """Genera una explicación textual para la feature más influyente."""
     templates = {
-        "severity_score": (
+        "severity": (
             f"Severidad ({fv.get('severity_score', 0):.0%}) superó "
             f"el patrón histórico del activo."
         ),
-        "timestamp_delta": (
+        "delta": (
             f"Frecuencia inusual — {fv.get('timestamp_delta', 0):.0f}s "
             f"desde el evento anterior (baseline: ~300s)."
         ),
-        "asset_value": (
+        "asset_val": (
             f"Activo de alto valor ({fv.get('asset_value', 0):.0%}) "
             f"involucrado en evento anómalo."
         ),

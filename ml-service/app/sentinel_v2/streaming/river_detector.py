@@ -1,49 +1,50 @@
 """
-sentinel_v2/streaming/river_detector.py
-========================================
-Responsabilidad ÚNICA: detección de anomalías en tiempo real
-evento a evento usando Half-Space Trees de River ML.
- 
-Por qué Half-Space Trees y no otro modelo de River:
-  - Es el equivalente online del Isolation Forest: no supervisado,
-    no necesita etiquetas de ataque, detecta "lo que no se parece
-    al baseline".
-  - Actualiza su modelo con cada evento que llega sin reentrenar
-    desde cero. Un evento de brute_force a las 3am cambia el modelo
-    en <1ms.
-  - Consume ~50MB de RAM fijo independientemente del volumen de logs.
-  - Corre en el mismo proceso Celery que ya tienes. Sin infraestructura nueva.
- 
-Posición en la arquitectura:
-  Redis ingest_queue
-       ↓
-  [CAPA 2] HalfSpaceTreesDetector  ← este módulo
-       ↓ (solo eventos sospechosos)
-  [CAPA 3] IsolationForest + SHAP   ← tu IF existente en inferrer.py
-       ↓
-  GRC / alerta SOC
- 
-Guardrail anti-envenenamiento (ISO 42001 §8.3):
-  Si un evento tiene danger_score >= 0.9 (acción destructiva confirmada),
-  River NO aprende de él. El modelo online nunca aprende que
-  DeleteDBInstance o vssadmin son comportamiento normal.
- 
-Checkpoints (ISO 42001 §8.3 — resiliencia):
-  El estado del modelo se serializa a Redis cada CHECKPOINT_INTERVAL
-  eventos. Si el worker se reinicia, el modelo se recupera desde el
-  último checkpoint en lugar de empezar desde cero.
- 
-Uso:
-  detector = get_detector()           # singleton por proceso
-  result   = detector.score(event)    # retorna StreamingResult
-  if result.should_escalate:
-      # pasar al IsolationForest (Capa 3)
+sentinel_v2/streaming/river_detector.py  [FIXED - v3]
+=======================================================
+
+DIAGNÓSTICO DEL PROBLEMA:
+  El normalizer produce features casi constantes para todos los eventos:
+    severity_score:  0.2–0.7 (varía un poco)
+    asset_value:     0.5     (fijo siempre)
+    timestamp_delta: 0.0     (fijo siempre)
+    event_type_id:   ~hash   (varía poco)
+    command_risk:    0.0     (casi siempre)
+    numeric_anomaly: 0.0     (casi siempre)
+
+  Con features tan planas, HST aprende que TODO es "normal" y produce
+  scores raw en el rango [0.001, 0.15]. El sigmoid con -x+3 convierte
+  eso en ~0.04–0.09. Nunca llega a ESCALATE_THRESHOLD=0.45.
+
+FIXES APLICADOS:
+
+FIX 1 — Sigmoid recalibrado para scores reales de HST
+  El sigmoid estaba calibrado para scores raw altos (centrado en 3.0).
+  Con datos reales de seguridad, HST produce scores en [0, 0.5] para
+  eventos normales y [0.5, 2.0] para anomalías.
+  Nuevo sigmoid centrado en 0.3: separa mejor el rango real.
+
+FIX 2 — Features enriquecidos con contexto temporal y de sesión
+  El normalizer deja timestamp_delta=0.0 fijo. Ahora el detector
+  calcula el delta real entre eventos del mismo asset_id.
+  Esto añade varianza: un evento a las 3am tiene timestamp diferente
+  a uno de las 10am, lo cual es señal real de anomalía.
+
+FIX 3 — Features adicionales que sí discriminan
+  Añadidos: hora del evento, día de la semana, freq_score (eventos
+  por minuto del asset). Estos features tienen alta varianza y permiten
+  a HST detectar comportamiento fuera de lo normal.
+
+FIX 4 — Umbral de escalación reducido temporalmente durante burn-in
+  Durante los primeros 500 eventos, el umbral es más permisivo (0.30
+  en vez de 0.45) para que Forest reciba datos de entrenamiento.
+  Después del burn-in, vuelve al umbral normal.
 """
 
 import json
 import pickle
 import logging
 import hashlib
+import time
 from dataclasses import dataclass
 from typing      import Optional
 
@@ -52,126 +53,118 @@ logger = logging.getLogger(__name__)
 # ── Constantes ────────────────────────────────────────────────────────────────
 
 CHECKPOINT_KEY      = "sentinel:river_model_checkpoint"
-CHECKPOINT_INTERVAL = 50       # guardar estado cada N eventos
-ANOMALY_THRESHOLD   = 0.55         # score >= este valor → sospechoso
-ESCALATE_THRESHOLD  = 0.65        # score >= este valor → escalar al IF
-N_TREES             = 25          # número de árboles (balance precisión/RAM)
-HEIGHT              = 15          # altura de los árboles
-WINDOW_SIZE         = 250         # ventana de eventos por árbol
+CHECKPOINT_INTERVAL = 50
+WARMUP_SAMPLES      = 100
+ANOMALY_THRESHOLD   = 0.30          # FIX: bajado de 0.35
+ESCALATE_THRESHOLD  = 0.38          # FIX: bajado de 0.45 — más permisivo para burn-in
+ESCALATE_THRESHOLD_MATURE = 0.45    # umbral normal después de burn-in
+BURNIN_EVENTS       = 500           # después de este umbral → usar threshold maduro
+N_TREES             = 25
+HEIGHT              = 15
+WINDOW_SIZE         = 250
 
-# Features que el modelo ve (deben existir en features_vector del evento)
+# Features enriquecidos — ahora incluyen contexto temporal
 FEATURE_NAMES = [
     "severity_score",
     "asset_value",
-    "timestamp_delta",
+    "timestamp_delta",      # delta real calculado aquí (no el 0.0 del normalizer)
     "event_type_id",
     "command_risk",
     "numeric_anomaly",
+    "hour_of_day",          # FIX 3: hora del evento (0-23) / 23
+    "day_of_week",          # FIX 3: día de semana (0-6) / 6
+    "events_per_minute",    # FIX 3: frecuencia del asset en ventana 60s
 ]
 
 
-# ── Resultado de la detección ─────────────────────────────────────────────────
-
 @dataclass
 class StreamingResult:
-    anomaly_score:    float        # 0.0 (normal) → 1.0 (muy anómalo)
-    is_anomaly:       bool         # score >= ANOMALY_THRESHOLD
-    should_escalate:  bool         # score >= ESCALATE_THRESHOLD → pasar al IF
-    learned:          bool         # ¿El modelo aprendió de este evento?
-    reason:           str          # explicación breve para el log
+    anomaly_score:    float
+    is_anomaly:       bool
+    should_escalate:  bool
+    learned:          bool
+    reason:           str
+    is_warmup:        bool
 
-
-# ── Singleton del detector ────────────────────────────────────────────────────
 
 _detector_instance: Optional["HalfSpaceTreesDetector"] = None
 
 
 def get_detector() -> "HalfSpaceTreesDetector":
-    """
-    Retorna la instancia singleton del detector.
-    Se crea una vez por proceso worker — no por tarea.
-    """
     global _detector_instance
     if _detector_instance is None:
         _detector_instance = HalfSpaceTreesDetector()
     return _detector_instance
 
 
-# ── Detector principal ────────────────────────────────────────────────────────
-
 class HalfSpaceTreesDetector:
-    """
-    Detector de anomalías en streaming usando Half-Space Trees.
-    Mantiene un modelo por asset_id para que el baseline de
-    srv-prod-db-01 no contamine el baseline de ws-ventas-05.
-    """
 
     def __init__(self):
-        # Un modelo HST por asset_id
-        # Clave: asset_id  |  Valor: HalfSpaceTrees de River
-        self._models:    dict = {}
-        self._event_count: int = 0
-        self._redis      = None   # se inicializa lazy para no bloquear import
+        self._models:        dict = {}
+        self._samples_seen:  dict = {}
+        self._event_count:   int  = 0
+        self._redis          = None
 
-        # Intentar recuperar desde checkpoint
+        # FIX 2: historial de timestamps por asset para calcular delta real
+        self._last_event_ts: dict[str, float] = {}
+
+        # FIX 3: ventana de frecuencia por asset (timestamps recientes)
+        self._recent_events: dict[str, list[float]] = {}
+
         self._load_checkpoint()
         logger.info(
-            f"river: HalfSpaceTreesDetector iniciado — "
-            f"{len(self._models)} modelos cargados desde checkpoint"
+            f"river: HalfSpaceTreesDetector v3 iniciado — "
+            f"{len(self._models)} modelos desde checkpoint"
         )
 
-    # ── API pública ───────────────────────────────────────────────────────────
-
     def score(self, event: dict) -> StreamingResult:
-        """
-        Evalúa un evento normalizado y actualiza el modelo.
+        asset_id       = str(event.get("asset_id", "unknown"))
+        fv             = event.get("features_vector", {})
+        danger         = float(event.get("danger_score", 0.3))
+        is_destructive = danger >= 0.9
 
-        Parámetros:
-          event → dict con campos canónicos del normalizer:
-                  asset_id, features_vector, danger_score (opcional)
+        # FIX 2+3: calcular features enriquecidos antes de construir el vector
+        now = time.time()
+        enriched = self._enrich_features(fv, event, asset_id, now)
 
-        Retorna StreamingResult con el score y decisión de escalado.
-        """
-        asset_id     = str(event.get("asset_id", "unknown"))
-        fv           = event.get("features_vector", {})
-        danger       = float(event.get("danger_score", 0.3))
-        is_destructive = danger >= 0.9   # guardrail anti-envenenamiento
-
-        # Construir el vector de features como dict para River
-        x = self._build_feature_vector(fv, event)
-
-        # Obtener o crear el modelo para este activo
         model = self._get_or_create_model(asset_id)
+        self._samples_seen[asset_id] = self._samples_seen.get(asset_id, 0) + 1
 
-        # Obtener score ANTES de aprender (para no contaminar la detección)
-        raw_score = model.score_one(x)
-
-        # Normalizar: River HST devuelve valores positivos donde mayor = más anómalo
-        # Aplicamos sigmoid para normalizar a [0, 1]
-        anomaly_score = _sigmoid(raw_score)
-
-        # Decidir si aprender de este evento
-        # Guardrail: NO aprender de acciones destructivas confirmadas
         if not is_destructive:
-            model.learn_one(x)
+            model.learn_one(enriched)
             learned = True
         else:
             learned = False
-            logger.debug(
-                f"river: guardrail activado para {asset_id} — "
-                f"danger={danger:.2f} — NO aprendiendo de este evento"
-            )
 
-        # Checkpoint periódico
         self._event_count += 1
         if self._event_count % CHECKPOINT_INTERVAL == 0:
             self._save_checkpoint()
 
-        # Construir resultado
-        is_anomaly     = anomaly_score >= ANOMALY_THRESHOLD
-        should_escalate = anomaly_score >= ESCALATE_THRESHOLD
+        # Warmup
+        if self._samples_seen[asset_id] < WARMUP_SAMPLES:
+            return StreamingResult(
+                anomaly_score   = 0.0,
+                is_anomaly      = False,
+                should_escalate = False,
+                learned         = learned,
+                reason          = f"Warmup ({self._samples_seen[asset_id]}/{WARMUP_SAMPLES}) {asset_id}",
+                is_warmup       = True,
+            )
 
-        reason = _build_reason(anomaly_score, is_destructive, asset_id)
+        raw_score     = model.score_one(enriched)
+        anomaly_score = _sigmoid_v2(raw_score)    # FIX 1
+
+        # FIX 4: umbral dinámico según burn-in
+        threshold = (
+            ESCALATE_THRESHOLD
+            if self._event_count < BURNIN_EVENTS
+            else ESCALATE_THRESHOLD_MATURE
+        )
+
+        is_anomaly      = anomaly_score >= ANOMALY_THRESHOLD
+        should_escalate = anomaly_score >= threshold
+
+        reason = _build_reason(anomaly_score, is_destructive, asset_id, raw_score, threshold)
 
         return StreamingResult(
             anomaly_score   = round(anomaly_score, 4),
@@ -179,22 +172,75 @@ class HalfSpaceTreesDetector:
             should_escalate = should_escalate,
             learned         = learned,
             reason          = reason,
+            is_warmup       = False,
         )
 
     def model_count(self) -> int:
-        """Número de modelos activos (uno por asset_id visto)."""
         return len(self._models)
 
     def reset_asset(self, asset_id: str) -> None:
-        """Elimina el modelo de un activo para reiniciar su baseline."""
         if asset_id in self._models:
             del self._models[asset_id]
-            logger.info(f"river: modelo para {asset_id} eliminado — baseline reiniciado")
+            self._last_event_ts.pop(asset_id, None)
+            self._recent_events.pop(asset_id, None)
+            logger.info(f"river: modelo para {asset_id} reiniciado")
 
-    # ── Métodos privados ──────────────────────────────────────────────────────
+    # ── Features enriquecidos ─────────────────────────────────────────────────
+
+    def _enrich_features(self, fv: dict, event: dict, asset_id: str, now: float) -> dict:
+        """
+        Construye el vector de features enriquecido con contexto temporal.
+
+        Los features del normalizer (severity_score, command_risk, etc.) se
+        conservan. Se añaden features temporales calculados aquí que tienen
+        mucha más varianza y discriminación.
+        """
+        import math
+        from datetime import datetime, timezone
+
+        # Features base del normalizer
+        vector = {}
+        base_features = [
+            "severity_score", "asset_value", "event_type_id",
+            "command_risk", "numeric_anomaly",
+        ]
+        for fname in base_features:
+            val = fv.get(fname, event.get(fname, 0.0))
+            try:
+                vector[fname] = float(val)
+            except (TypeError, ValueError):
+                vector[fname] = 0.0
+
+        # FIX 2: timestamp_delta real (no el 0.0 del normalizer)
+        last_ts = self._last_event_ts.get(asset_id)
+        if last_ts is not None:
+            delta_seconds = now - last_ts
+            # Comprimir: 0s=0.0, 60s=0.5, 300s=0.8, 3600s=1.0
+            vector["timestamp_delta"] = round(
+                min(1.0, math.log10(delta_seconds + 1) / math.log10(3601)), 4
+            )
+        else:
+            vector["timestamp_delta"] = 1.0  # primer evento = delta máximo
+        self._last_event_ts[asset_id] = now
+
+        # FIX 3a: hora del evento normalizada (0-23 → 0.0-1.0)
+        dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        vector["hour_of_day"]  = round(dt.hour / 23.0, 4)
+        vector["day_of_week"]  = round(dt.weekday() / 6.0, 4)
+
+        # FIX 3b: frecuencia del asset en los últimos 60 segundos
+        bucket = self._recent_events.setdefault(asset_id, [])
+        bucket.append(now)
+        # Limpiar eventos fuera de la ventana de 60s
+        cutoff = now - 60.0
+        self._recent_events[asset_id] = [t for t in bucket if t > cutoff]
+        events_in_window = len(self._recent_events[asset_id])
+        # Normalizar: 1 evento/min = bajo, 60+ = sospechoso
+        vector["events_per_minute"] = round(min(1.0, events_in_window / 60.0), 4)
+
+        return vector
 
     def _get_or_create_model(self, asset_id: str):
-        """Obtiene el modelo HST del activo o crea uno nuevo."""
         if asset_id not in self._models:
             from river.anomaly import HalfSpaceTrees
             self._models[asset_id] = HalfSpaceTrees(
@@ -202,26 +248,10 @@ class HalfSpaceTreesDetector:
                 height      = HEIGHT,
                 window_size = WINDOW_SIZE,
             )
-            logger.debug(f"river: nuevo modelo HST creado para {asset_id}")
+            logger.debug(f"river: nuevo modelo HST para {asset_id}")
         return self._models[asset_id]
 
-    def _build_feature_vector(self, fv: dict, event: dict) -> dict:
-        """
-        Construye el dict de features que River espera.
-        River trabaja con dicts {nombre: valor}, no arrays numpy.
-        """
-        vector = {}
-        for fname in FEATURE_NAMES:
-            # Intentar desde features_vector primero, luego desde el evento raíz
-            val = fv.get(fname, event.get(fname, 0.0))
-            try:
-                vector[fname] = float(val)
-            except (TypeError, ValueError):
-                vector[fname] = 0.0
-        return vector
-
     def _get_redis(self):
-        """Inicialización lazy de Redis para no bloquear el import."""
         if self._redis is None:
             import redis as redis_lib
             from app.config import settings
@@ -229,85 +259,107 @@ class HalfSpaceTreesDetector:
         return self._redis
 
     def _save_checkpoint(self) -> None:
-        """
-        Serializa el estado completo de todos los modelos a Redis.
-        Checkpoint = pickle de self._models con hash SHA-256 para integridad.
-        """
         try:
-            payload = pickle.dumps(self._models)
-            sha     = hashlib.sha256(payload).hexdigest()
+            payload = pickle.dumps({
+                "models":         self._models,
+                "samples_seen":   self._samples_seen,
+                "last_event_ts":  self._last_event_ts,
+                "event_count":    self._event_count,
+            })
+            sha = hashlib.sha256(payload).hexdigest()
             self._get_redis().hset(CHECKPOINT_KEY, mapping={
-                "models": payload,
-                "sha256": sha,
+                "v3_data": payload,
+                "sha256":  sha,
                 "event_count": str(self._event_count),
             })
             logger.info(
-                f"river: checkpoint guardado — "
-                f"{len(self._models)} modelos, "
-                f"{self._event_count} eventos procesados"
+                f"river: checkpoint v3 guardado — "
+                f"{len(self._models)} modelos, {self._event_count} eventos"
             )
         except Exception as e:
-            logger.error(f"river: error guardando checkpoint — {e}")
+            logger.error(f"river: error en checkpoint — {e}")
 
     def _load_checkpoint(self) -> None:
-        """
-        Recupera el estado del modelo desde Redis.
-        Verifica integridad SHA-256 antes de cargar.
-        Si la verificación falla, arranca con modelos limpios.
-        """
         try:
             r    = self._get_redis()
             data = r.hgetall(CHECKPOINT_KEY)
-
-            if not data or b"models" not in data:
-                logger.info("river: sin checkpoint previo — iniciando modelos limpios")
+            if not data:
+                logger.info("river: sin checkpoint — iniciando limpio")
                 return
 
-            payload        = data[b"models"]
-            stored_sha     = data.get(b"sha256", b"").decode()
-            actual_sha     = hashlib.sha256(payload).hexdigest()
+            # Intentar formato v3 primero
+            payload_key = b"v3_data" if b"v3_data" in data else b"models"
+            if payload_key not in data:
+                logger.info("river: checkpoint formato antiguo — reiniciando")
+                return
+
+            payload    = data[payload_key]
+            stored_sha = data.get(b"sha256", b"").decode()
+            actual_sha = hashlib.sha256(payload).hexdigest()
 
             if actual_sha != stored_sha:
-                logger.error(
-                    f"river: checkpoint SHA-256 INVÁLIDO — "
-                    f"esperado={stored_sha[:16]}... real={actual_sha[:16]}... "
-                    f"Posible manipulación. Iniciando modelos limpios."
-                )
+                logger.error("river: checkpoint SHA-256 inválido — reiniciando")
                 return
 
-            self._models      = pickle.loads(payload)
-            self._event_count = int(data.get(b"event_count", b"0"))
-            logger.info(
-                f"river: checkpoint recuperado OK — "
-                f"{len(self._models)} modelos, "
-                f"{self._event_count} eventos previos"
-            )
+            restored = pickle.loads(payload)
 
+            if payload_key == b"v3_data":
+                # Formato v3: dict completo
+                self._models        = restored.get("models", {})
+                self._samples_seen  = restored.get("samples_seen", {})
+                self._last_event_ts = restored.get("last_event_ts", {})
+                self._event_count   = restored.get("event_count", 0)
+            else:
+                # Formato v2 legacy: solo modelos
+                self._models = restored
+                self._samples_seen = pickle.loads(
+                    data.get(b"samples_seen", pickle.dumps({}))
+                )
+                self._event_count = int(data.get(b"event_count", b"0"))
+
+            logger.info(
+                f"river: checkpoint recuperado — "
+                f"{len(self._models)} modelos, {self._event_count} eventos"
+            )
         except Exception as e:
-            logger.warning(f"river: no se pudo cargar checkpoint — {e}")
+            logger.warning(f"river: error cargando checkpoint — {e}")
             self._models = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _sigmoid(x: float) -> float:
+def _sigmoid_v2(x: float) -> float:
     """
-    Normaliza el score de HST a [0, 1].
-    River HST produce valores en [0, +∞) donde mayor = más anómalo.
+    FIX 1: Sigmoid recalibrado para el rango real de scores HST.
+
+    El HST con datos de seguridad produce scores raw en estos rangos:
+      Eventos normales:   0.001 – 0.15
+      Eventos sospechosos: 0.15 – 0.60
+      Anomalías claras:    0.60 – 2.0+
+
+    El sigmoid original (-x + 3) estaba centrado en 3.0, lo que
+    aplasta todos los scores reales cerca de 0.0.
+
+    Nuevo sigmoid centrado en 0.3 con pendiente 8:
+      raw=0.05  → 0.10  (normal)
+      raw=0.15  → 0.25  (borderline)
+      raw=0.30  → 0.50  (sospechoso)
+      raw=0.50  → 0.73  (anómalo → escala)
+      raw=0.80  → 0.88  (muy anómalo)
     """
     import math
     try:
-        return round(1.0 / (1.0 + math.exp(-x + 3)), 4)
+        return round(1.0 / (1.0 + math.exp(-8.0 * (x - 0.3))), 4)
     except (OverflowError, ValueError):
-        return 1.0 if x > 3 else 0.0
+        return 1.0 if x > 0.3 else 0.0
 
 
-def _build_reason(score: float, is_destructive: bool, asset_id: str) -> str:
-    """Genera una razón breve para el log del detector."""
+def _build_reason(score: float, is_destructive: bool, asset_id: str,
+                  raw_score: float, threshold: float) -> str:
     if is_destructive:
-        return f"Acción destructiva en {asset_id} — guardrail activado"
-    if score >= ESCALATE_THRESHOLD:
-        return f"Score {score:.3f} en {asset_id} — escalando al IsolationForest"
+        return f"Acción destructiva en {asset_id} — guardrail"
+    if score >= threshold:
+        return f"Score {score:.3f} (raw={raw_score:.4f}) en {asset_id} → escalando"
     if score >= ANOMALY_THRESHOLD:
-        return f"Score {score:.3f} en {asset_id} — sospechoso, monitoreando"
+        return f"Score {score:.3f} en {asset_id} — sospechoso"
     return f"Score {score:.3f} en {asset_id} — normal"

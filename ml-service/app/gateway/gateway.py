@@ -191,12 +191,15 @@ async def analyze(request: Request):
     # River ML (Capa 2) procesará el evento vía process_ingest_queue.
     # Si River lo marca como sospechoso, irá a escalate_queue → IF (Capa 3).
     try:
-        sent = get_filter().send(enriched)
+        # from_siem=True: aplica filtro permisivo para alertas ya triageadas.
+        # El SIEM ya filtró — no muestreamos brute forces ni descartamos
+        # floods de alta severidad.
+        sent = get_filter().send(enriched, from_siem=True)
         if sent:
             celery.send_task("process_ingest_queue")
-            logger.debug(f"[{client['company_name']}] Evento encolado vía KafkaFilter")
+            logger.debug(f"[{client['company_name']}] Alerta SIEM encolada")
         else:
-            logger.debug(f"[{client['company_name']}] Evento descartado por KafkaFilter")
+            logger.debug(f"[{client['company_name']}] Alerta descartada (ruido puro)")
     except Exception as e:
         logger.error(f"Error en KafkaFilter/ingest: {e}")
     # ── FIN CAMBIO 1 ──────────────────────────────────────────────────────
@@ -212,7 +215,8 @@ async def analyze(request: Request):
     # ── FIN CAMBIO 2 ──────────────────────────────────────────────────────
 
     # 6. Resultado para el GRC — sin cambios
-    result       = _build_result(enriched, correlation)
+    # 6. Resultado para el GRC — Ahora Híbrido (Viejo + Nuevo)
+    result       = _build_result(enriched, correlation, normalized)
     risk_metrics = calculate_risk(enriched)
 
     # 7. Reenvío al GRC con anti-saturación — sin cambios
@@ -257,9 +261,17 @@ async def analyze(request: Request):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _build_result(enriched: dict, correlation: dict) -> dict:
+def _build_result(enriched: dict, correlation: dict, normalized: dict = None) -> dict:
     """Traduce datos técnicos a lenguaje de analista."""
+    # Prioridad 1: Correlación compleja (el viejo)
     pattern  = correlation.get("pattern", "none")
+    
+    # Prioridad 2: IA del Normalizador V2 (si el viejo no detectó nada)
+    if pattern == "none" and normalized:
+        v2_pattern = normalized.get("pattern_hint", "none")
+        if v2_pattern != "none":
+            pattern = v2_pattern
+
     ti_match = enriched.get("threat_intel", False)
     score    = enriched.get("severity_score", 0.3)
 
@@ -284,6 +296,11 @@ def _build_result(enriched: dict, correlation: dict) -> dict:
     }
 
     reason = reasons.get(pattern, reasons["none"])
+    
+    # Fallback para la descripción detallada de la IA
+    if reason == reasons["none"] and normalized:
+        reason = normalized.get("description", reasons["none"])
+
     if ti_match:
         reason += " IP encontrada en feeds de inteligencia de amenazas."
 

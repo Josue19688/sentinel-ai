@@ -10,12 +10,19 @@ from app.sentinel_v2.normalizer.universal import normalize
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)
-FEATURES = ["severity_score", "asset_value", "timestamp_delta"]
+FEATURES = ["severity", "asset_val", "delta"]
+FEATURE_KEYS = {
+    "severity": "severity_score",
+    "asset_val": "asset_value",
+    "delta": "timestamp_delta",
+}
 
 _model_cache = {"model": None, "scaler": None, "version": None}
 
 
 class InferenceResult(BaseModel):
+    model_config = {"protected_namespaces": ()}  # Silencía warning "model_version"
+
     recommendation_id: Optional[str] = None
     anomaly_score: float
     aro_suggested: float
@@ -99,7 +106,11 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
         )
 
     # 4. Construir vector y predecir
-    vec = np.array([[event.features_vector.get(f, 0.0) for f in FEATURES]])
+    import pandas as pd
+    vec = pd.DataFrame(
+        [[event.features_vector.get(FEATURE_KEYS[f], 0.0) for f in FEATURES]],
+        columns=FEATURES
+    )
     vec_scaled = _model_cache["scaler"].transform(vec)
     score_raw = _model_cache["model"].decision_function(vec_scaled)[0]
 

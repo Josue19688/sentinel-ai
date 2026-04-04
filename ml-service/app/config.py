@@ -4,7 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://ml:ml@ml-db:5432/ml_features"
     REDIS_URL: str = "redis://ml-redis:6379/0"
-    MODEL_MODE: str = "DUMMY"               # DUMMY | SHADOW | LIVE
+    APP_ENV: str = "DEVELOPMENT"           # PRODUCTION | DEVELOPMENT
+    DEV_GRC_URL: str = "http://host.docker.internal:8000"
+    DEV_GRC_API_KEY: str = "grc_4f3c8d55112e3853ba633e9960dfa98b"
+    DEV_GRC_API_SECRET: str = "N4ZSmO9tkFSQZ5sL2XY2-GPozCOjClRHcrCKFAHoUh0"
+    MODEL_MODE: str = "LIVE"               # DUMMY | SHADOW | LIVE
     SECRET_KEY: str = "dev-secret"
     LOG_LEVEL: str = "INFO"
     SHAP_TIMEOUT_S: int = 30
