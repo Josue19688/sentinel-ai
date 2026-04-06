@@ -1,108 +1,50 @@
-# ── Python ────────────────────────────────────────────────────
-__pycache__/
-*.py[cod]
-*$py.class
-*.pyo
-.Python
-*.egg-info/
-dist/
-build/
-*.egg
-.eggs/
+# ── POLITICA DE LISTA BLANCA (WHITELIST) ──────────────────────
+# Ignorar todo por defecto en la raíz
+/*
 
-# ── Archivos locales con credenciales — NUNCA al repositorio ──
-nosubir.py
-nosubir*.py
-*credentials*.py
+# ── EXCEPCIONES: ARCHIVOS PERMITIDOS EN LA RAÍZ ──────────────
+!/README.md
+!/ml-service/
+!/docker-compose.yml
+!/.env.example
+!/.gitignore
 
-# ── Entornos virtuales ────────────────────────────────────────
-.venv/
-venv/
-env/
-ENV/
-
-# ── Variables de entorno — NUNCA al repositorio ───────────────
-.env
-.env.local
-.env.*.local
-
-# ── Modelos ML — artefactos grandes, usar volumen Docker ──────
+# ── PYTHON / ML-SERVICE (IGNORAR LOCALES) ─────────────────────
+**/__pycache__/
+**/*.py[cod]
+ml-service/**/__pycache__/
+ml-service/**/*.py[cod]
+ml-service/venv/
+ml-service/.venv/
+ml-service/env/
+ml-service/ENV/
 ml-service/model_artifacts/
-model_artifacts/
-*.pkl
-*.joblib
+ml-service/logs.txt
+ml-service/tmp_fix.py
+ml-service/pytest.ini
+ml-service/tests/
+ml-service/restore_keys.py
+ml-service/fix_admin_auth.py
+ml-service/app/fix_admin_auth.py
 
-# ── Archivos temporales y backups ─────────────────────────────
-*.zip
-*.tar.gz
-*.bak
-*.tmp
-*.swp
-
-# ── IDEs ──────────────────────────────────────────────────────
+# ── ARCHIVOS DE SISTEMA E IDEs ───────────────────────────────
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
 *.code-workspace
-
-# ── Docker ────────────────────────────────────────────────────
+.agent/
+.gemini/
+tmp/
 .docker/
 
-# ── Testing y cobertura ───────────────────────────────────────
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# ── Logs ──────────────────────────────────────────────────────
-*.log
-logs/
-
-# ── OS ────────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-
-# ── Exportaciones y Dumps Locales ─────────────────────────────
-*.sql
-dump.rdb
-*.sqlite3
-
-# ── Certificados TLS y Secretos en texto plano ────────────────
+# ── VARIABLES Y SECRETOS (NUNCA SUBIR) ────────────────────────
+.env
+.env.local
+.env.*.local
 *.pem
 *.key
 *.crt
 *.cert
 secrets.json
 .secrets/
-
-# ── Carpetas privadas del Agente local ────────────────────────
-.gemini/
-
-# ── Scripts Privados y Migraciones de Base de Datos ───────────
-scripts/
-alembic/
-migrations/
-
-# ── Documentación Privada y Herramientas ──────────────────────
-Documentacion necesaria/
-documentacion-*.md
-plan_mitigacion*.md
-generate_doc.js
-
-# ── Testing ───────────────────────────────────────────────────
-tests/
-ml-service/tests/
-
-# ── Local Debug, Sandbox and Extracts (Sentinel ML v2.0) ──────
-debug_sandbox*.py
-extract.txt
-*debug*.txt
-*sandbox*.txt
-*.jsonl
-*debug*.py
-sentinel_test_suite.py
-stress-testing.py
-
-# ── Local Docs (Except README & Core Project Plan) ───────────
-*.md
-!README.md
-!plan_mitigacion_sentinel_ml.md

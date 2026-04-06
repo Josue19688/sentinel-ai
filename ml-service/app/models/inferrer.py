@@ -1,12 +1,15 @@
 """
 Inferrer — Motor de inferencia <50ms
 Incluye: normalización, predicción, correlación multi-activo, circuit breaker.
+
+FIX: cache de modelo se invalida automáticamente cuando el trainer
+     escribe una nueva versión. Ya no requiere reiniciar el proceso.
 """
 import pickle, hashlib, os, time, logging, numpy as np
 from typing import Optional
 from pydantic import BaseModel
 from app.config import settings
-from app.sentinel_v2.normalizer.universal import normalize
+from app.normalizer.universal import normalize
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)
@@ -21,7 +24,7 @@ _model_cache = {"model": None, "scaler": None, "version": None}
 
 
 class InferenceResult(BaseModel):
-    model_config = {"protected_namespaces": ()}  # Silencía warning "model_version"
+    model_config = {"protected_namespaces": ()}
 
     recommendation_id: Optional[str] = None
     anomaly_score: float
@@ -33,9 +36,23 @@ class InferenceResult(BaseModel):
     explanation_pending: bool
 
 
-def _load_model():
+def _get_current_version(client_id: str) -> Optional[str]:
+    """
+    Lee el archivo latest.txt que el trainer escribe al terminar.
+    Coste: un open() por petición — despreciable frente a la inferencia.
+    Esto permite detectar nuevas versiones sin reiniciar el proceso.
+    """
+    latest_path = os.path.join(settings.MODEL_ARTIFACTS_PATH, f"{client_id}_latest.txt")
+    try:
+        with open(latest_path) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _load_model(client_id: str):
     """Carga el modelo activo desde disco con verificación de integridad."""
-    path = _get_active_artifact_path()
+    path = _get_active_artifact_path(client_id)
     if not path:
         return None, None, None
 
@@ -60,11 +77,18 @@ def _load_model():
     return artifacts["model"], artifacts["scaler"], version
 
 
-def _get_active_artifact_path() -> Optional[str]:
+def _get_active_artifact_path(client_id: str) -> Optional[str]:
+    """
+    Retorna el directorio del modelo más reciente para este client_id.
+    Filtra por prefijo para no mezclar modelos de distintos clientes.
+    """
     base = settings.MODEL_ARTIFACTS_PATH
     if not os.path.exists(base):
         return None
-    versions = sorted([d for d in os.listdir(base) if os.path.isdir(f"{base}/{d}")])
+    versions = sorted([
+        d for d in os.listdir(base)
+        if os.path.isdir(f"{base}/{d}") and d.startswith(client_id)
+    ])
     return f"{base}/{versions[-1]}" if versions else None
 
 
@@ -82,18 +106,25 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
 
     # 2. Modo DUMMY — solo valida conectividad
     if settings.MODEL_MODE == "DUMMY":
-        rec_id = await _save_recommendation(event, 0.5, 0.5, 0.5, "dummy", client_id)
         return InferenceResult(
-            recommendation_id=rec_id, anomaly_score=0.5,
+            recommendation_id=None, anomaly_score=0.5,
             aro_suggested=0.5, confidence=0.5,
             model_version="dummy", model_mode="DUMMY",
             lateral_movement_detected=False, explanation_pending=False
         )
 
-    # 3. Cargar modelo (con cache)
+    # 3. Cargar modelo con invalidación por versión
+    # Se compara la versión en cache contra latest.txt en disco.
+    # Si el trainer escribió una versión nueva, se recarga automáticamente.
     global _model_cache
-    if _model_cache["model"] is None:
-        _model_cache["model"], _model_cache["scaler"], _model_cache["version"] = _load_model()
+    current_version = _get_current_version(client_id)
+
+    if _model_cache["model"] is None or _model_cache["version"] != current_version:
+        logger.info(
+            f"inferrer: recargando modelo — "
+            f"cache={_model_cache['version']} disk={current_version}"
+        )
+        _model_cache["model"], _model_cache["scaler"], _model_cache["version"] = _load_model(client_id)
 
     if _model_cache["model"] is None:
         # Fallback ISO 27005 determinístico
@@ -115,21 +146,16 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     score_raw = _model_cache["model"].decision_function(vec_scaled)[0]
 
     # Normalizar score a [0, 1] donde 1 = máxima anomalía
-    anomaly_score = float(1 / (1 + np.exp(score_raw)))  # sigmoid inverso
-    aro_suggested = anomaly_score * 12   # escala a ocurrencias anuales
+    anomaly_score = float(1 / (1 + np.exp(score_raw)))
+    aro_suggested = anomaly_score * 12
     confidence    = min(abs(score_raw) / 0.5, 1.0)
 
     # 5. Detección de movimiento lateral
     lateral = await _check_lateral_movement(event, client_id)
 
-    # 6. Guardar recomendación
-    rec_id = await _save_recommendation(
-        event, anomaly_score, aro_suggested, confidence,
-        _model_cache["version"], client_id, lateral
-    )
-
+    # 6. Retornar resultado
     return InferenceResult(
-        recommendation_id=rec_id,
+        recommendation_id=None,
         anomaly_score=anomaly_score,
         aro_suggested=aro_suggested,
         confidence=confidence,
@@ -160,15 +186,3 @@ async def _check_lateral_movement(event, client_id: str) -> bool:
         """, client_id, event.src_ip, event.asset_id)
 
     return row is not None
-
-
-async def _save_recommendation(event, score, aro, confidence, version, client_id, lateral=False) -> str:
-    async with get_db_conn() as conn:
-        row = await conn.fetchrow("""
-            INSERT INTO ml_recommendations
-                (client_id, asset_id, anomaly_score, aro_suggested, confidence,
-                 model_version, model_mode, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING')
-            RETURNING id::text
-        """, client_id, event.asset_id, score, aro, confidence, version, settings.MODEL_MODE)
-    return row["id"]

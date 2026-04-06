@@ -16,10 +16,24 @@ class ModelInfo:
     artifact_path: str
 
 
-async def get_active_model() -> Optional[ModelInfo]:
+async def get_active_model(client_id: Optional[str] = None) -> Optional[ModelInfo]:
     base = settings.MODEL_ARTIFACTS_PATH
     if not os.path.exists(base):
         return None
+
+    # Si se pasa client_id, usar latest.txt (misma fuente de verdad que el inferrer)
+    if client_id:
+        latest_path = os.path.join(base, f"{client_id}_latest.txt")
+        if not os.path.exists(latest_path):
+            return None
+        with open(latest_path) as f:
+            latest = f.read().strip()
+        artifact_path = f"{base}/{latest}"
+        if not os.path.isdir(artifact_path):
+            return None
+        return ModelInfo(version=latest, artifact_path=artifact_path)
+
+    # Fallback genérico sin client_id: toma el último directorio disponible
     versions = sorted([d for d in os.listdir(base) if os.path.isdir(f"{base}/{d}")])
     if not versions:
         return None
@@ -41,11 +55,9 @@ async def register_model_version(
     from app.db import get_db_conn
     async with get_db_conn() as conn:
         async with conn.transaction():
-            # Desactivar versión activa anterior
             await conn.execute(
                 "UPDATE model_registry SET is_active = FALSE WHERE is_active = TRUE"
             )
-            # Registrar la nueva versión como activa
             await conn.execute("""
                 INSERT INTO model_registry
                     (version, algorithm, f1_score, artifact_path, is_active)
@@ -58,8 +70,8 @@ async def register_model_version(
     )
 
 
-async def get_model_health() -> dict:
-    model = await get_active_model()
+async def get_model_health(client_id: Optional[str] = None) -> dict:
+    model = await get_active_model(client_id)
     from app.drift.psi_monitor import check_circuit_breaker
     cb = await check_circuit_breaker()
 
@@ -70,7 +82,6 @@ async def get_model_health() -> dict:
             "circuit_breaker": cb.state
         }
 
-    # Leer métricas desde model_registry si están disponibles
     registry_info = await _get_registry_metrics(model.version)
 
     return {

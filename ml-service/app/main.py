@@ -1,21 +1,26 @@
 """
 Sentinel ML Service — API Principal
-Inferencia <50ms · HMAC Auth · Circuit Breaker · ISO 42001
+Inferencia <50ms · JWT/API-Key Auth · Circuit Breaker · ISO 42001
 """
 from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-import time, os, logging
+import time, logging
 
 from app.config import settings
 from app.db import get_pool
-from app.auth.hmac_validator import verify_hmac
+from typing import Annotated
+from app.auth.dependencies import CurrentApiClient, CurrentUser, get_current_identity
 from app.models.inferrer import run_inference
 from app.models.registry import get_active_model
 from app.audit.hash_chain import log_audit_event
 from app.drift.psi_monitor import check_circuit_breaker, close_circuit, record_failure
-from app.api.routes import router
-from app.gateway.gateway import router as gateway_router
+from app.gateway.router import router as gateway_router
+from app.api.auth_router import router as auth_router
+from app.api.keys_router import router as keys_router
+from app.api.trainer_router import router as trainer_router
+from app.api.assets_router import router as assets_router
 
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -23,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Fail-fast: si la DB no está disponible, el servicio no arranca
     await get_pool()
     logger.info(f"Sentinel ML Service starting — MODE: {settings.MODEL_MODE}")
     yield
@@ -32,26 +36,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Sentinel ML Service",
-    description="Motor de detección de anomalías para GRC · ISO 27001 / 42001",
+    description="Motor de deteccion de anomalias para GRC · ISO 27001 / 42001",
     version="1.0.0",
     lifespan=lifespan
 )
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Permitir requests desde el localhost:8080 del dashboard
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(router)
 app.include_router(gateway_router)
-
-from app.api.trainer_routes import router as trainer_router
+app.include_router(auth_router)
+app.include_router(keys_router)
 app.include_router(trainer_router)
+app.include_router(assets_router)
 
 
 @app.get("/health")
@@ -68,32 +70,37 @@ async def health():
 
 
 @app.get("/health/model")
-async def health_model():
+async def health_model(
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+):
     """Estado detallado del modelo — para monitoreo y alertas."""
     from app.models.registry import get_model_health
-    return await get_model_health()
+    client_id = None
+    if identity is not None:
+        client_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
+    return await get_model_health(client_id)
 
 
 @app.post("/infer")
 async def infer(
     request: Request,
     background_tasks: BackgroundTasks,
-    client_id: str = Depends(verify_hmac)
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
 ):
     """
     Endpoint principal de inferencia.
     - Responde en <50ms con anomaly_score
-    - Encola SHAP en background (disponible en ~30s)
+    - Encola SHAP en background (disponible en aprox 30s)
     """
     t0 = time.perf_counter()
+    client_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
 
-    # Circuit Breaker check
     cb = await check_circuit_breaker()
     if cb.state == "OPEN":
         raise HTTPException(503, detail={
             "error": "circuit_breaker_open",
             "fallback": "iso27005_deterministic",
-            "message": "ML Service degradado. Usando lógica ISO 27005."
+            "message": "ML Service degradado. Usando logica ISO 27005."
         })
 
     body = await request.json()
@@ -102,20 +109,17 @@ async def infer(
         result = await run_inference(body, client_id)
     except Exception as e:
         await log_audit_event("INFERENCE_ERROR", str(e), client_id, {})
-        # Si falla en HALF_OPEN → el sistema no se recuperó, volver a OPEN
         if cb.state == "HALF_OPEN":
             await record_failure()
         raise HTTPException(500, detail=str(e))
 
-    # Inferencia exitosa en HALF_OPEN → sistema recuperado, cerrar Circuit Breaker
     if cb.state == "HALF_OPEN":
         await close_circuit()
 
     latency_ms = (time.perf_counter() - t0) * 1000
 
-    # SHAP en background — nunca bloquea la respuesta
     if result.recommendation_id:
-        from app.worker import compute_shap
+        from app.tasks.shap_task import compute_shap
         background_tasks.add_task(compute_shap.delay, str(result.recommendation_id))
 
     await log_audit_event("INFERENCE", result.recommendation_id, client_id, result.dict())
@@ -132,36 +136,42 @@ async def infer(
 
 @app.get("/recommendations")
 async def list_recommendations(
-    client_id: str = Depends(verify_hmac),
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)],
     status: str = "PENDING",
-    limit: int = 50
+    limit: int = 50,
 ):
     from app.api.recommendations import get_recommendations
-    return await get_recommendations(client_id, status, limit)
+    # Extraer ID común para auditoría (usamos user_id para que coincida con la creación)
+    actor_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
+    return await get_recommendations(actor_id, status, limit)
 
 
 @app.post("/recommendations/{rec_id}/approve")
-async def approve(rec_id: str, client_id: str = Depends(verify_hmac), note: str = ""):
+async def approve(
+    rec_id: str,
+    note: str = "",
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+):
     from app.api.recommendations import update_recommendation
-    return await update_recommendation(rec_id, client_id, "APPROVED", note)
+    actor_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
+    return await update_recommendation(rec_id, actor_id, "APPROVED", note)
 
 
 @app.post("/recommendations/{rec_id}/reject")
-async def reject(rec_id: str, client_id: str = Depends(verify_hmac), note: str = ""):
+async def reject(
+    rec_id: str,
+    note: str = "",
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+):
     from app.api.recommendations import update_recommendation
-    return await update_recommendation(rec_id, client_id, "REJECTED", note)
+    actor_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
+    return await update_recommendation(rec_id, actor_id, "REJECTED", note)
 
 
 @app.get("/audit/verify")
-async def verify_audit_chain(client_id: str = Depends(verify_hmac)):
-    """Verificación de integridad del Hash Chain — para auditorías ISO 27001."""
+async def verify_audit_chain(
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+):
+    """Verificacion de integridad del Hash Chain — para auditorias ISO 27001."""
     from app.audit.hash_chain import verify_chain
-    result = await verify_chain()
-    return result
-
-
-@app.get("/dashboard", include_in_schema=False)
-async def dashboard():
-    """Status UI simple — sin dependencias externas."""
-    from app.dashboard import render_dashboard
-    return await render_dashboard()
+    return await verify_chain()
