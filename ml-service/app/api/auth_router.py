@@ -2,13 +2,24 @@
 api/auth_router.py — Autenticacion de usuarios (JWT) Refactored a RSR
 """
 import logging
+import time
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from app.schemas.auth import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest
 from app.auth.dependencies import CurrentUser, require_role
 from app.services.auth_service import AuthService
+from app.db import get_redis
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+async def _check_login_rate_limit(client_ip: str) -> None:
+    redis = await get_redis()
+    key   = f"login_rl:{client_ip}"
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, 60)
+    if count > 10:
+        raise HTTPException(status_code=429, detail="Demasiados intentos. Intenta en 1 minuto.")
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(
@@ -25,21 +36,6 @@ async def register(
     except FileExistsError as e:
         raise HTTPException(409, str(e))
 
-import time
-from collections import defaultdict
-from fastapi import Request
-
-from app.db import get_redis
-
-async def _check_login_rate_limit(client_ip: str) -> None:
-    redis = await get_redis()
-    key   = f"login_rl:{client_ip}"
-    count = await redis.incr(key)
-    if count == 1:
-        await redis.expire(key, 60)
-    if count > 10:
-        raise HTTPException(code=429, detail="Demasiados intentos. Intenta en 1 minuto.")
-        
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
@@ -47,7 +43,6 @@ async def login(body: LoginRequest, request: Request):
 
     try:
         access, refresh = await AuthService.login(body)
-        # Auth ok -> Reset rate limiter option, but for now we let it slide.
         return TokenResponse(access_token=access, refresh_token=refresh)
     except ValueError as e:
         raise HTTPException(401, str(e))

@@ -33,12 +33,15 @@ class ModelTrainer:
         """
         pool = await get_pool()
         
-        # ── 1. Extracción de Histórico (Ingesta Vectorizada) ───────────────
+        # ── 1. Extracción de Histórico ───────────────
         query = """
-            SELECT severity_score, asset_value, features_vector 
-            FROM normalized_features 
-            WHERE client_id = $1 
-              AND created_at >= NOW() - INTERVAL '1 day' * $2
+            SELECT n.severity_score, n.features_vector, n.created_at, n.asset_id,
+                   n.pattern_hint, a.valor_activo
+            FROM normalized_features n
+            LEFT JOIN assets a ON n.asset_id = a.hostname AND n.client_id = a.client_id
+            WHERE n.client_id = $1 
+              AND n.created_at >= NOW() - INTERVAL '1 day' * $2
+            ORDER BY n.asset_id, n.created_at ASC
         """
         
         records = []
@@ -48,7 +51,12 @@ class ModelTrainer:
             if len(rows) < 50:
                 logger.warning(f"Entrenamiento abortado para {client_id}: solo {len(rows)} registros (mínimo 50).")
                 return {"status": "aborted", "reason": "insufficient_data"}
-                
+
+            from datetime import timezone
+            # Temporal structures to compute delta and frequency
+            last_ts = {}
+            recent_events = {}
+            
             for r in rows:
                 row_dict = dict(r)
                 fv = row_dict.get("features_vector", {})
@@ -60,12 +68,62 @@ class ModelTrainer:
                     except:
                         fv = {}
                 
+                # Timestamp logic
+                now_dt = row_dict["created_at"]
+                if now_dt.tzinfo is None:
+                    now_dt = now_dt.replace(tzinfo=timezone.utc)
+                now_ts = now_dt.timestamp()
+                
+                asset_id = row_dict["asset_id"]
+                
+                # FIX feature: timestamp_delta
+                ts_last = last_ts.get(asset_id)
+                import math
+                if ts_last is not None:
+                    delta_seconds = now_ts - ts_last
+                    t_delta = round(min(1.0, math.log10(delta_seconds + 1) / math.log10(3601)), 4)
+                else:
+                    t_delta = 1.0
+                last_ts[asset_id] = now_ts
+                
+                # FIX feature: events_per_minute
+                bucket = recent_events.setdefault(asset_id, [])
+                bucket.append(now_ts)
+                cutoff = now_ts - 60.0
+                recent_events[asset_id] = [t for t in bucket if t > cutoff]
+                epm = round(min(1.0, len(recent_events[asset_id]) / 60.0), 4)
+
+                # FIX feature: asset_value from table or activity
+                db_val = row_dict["valor_activo"]
+                if db_val is not None:
+                    ceiling = float(getattr(settings, "ASSET_VALUE_CEILING", 100000) or 100000)
+                    real_val = min(float(db_val) / ceiling, 1.0)
+                else:
+                    real_val = epm # Fallback to activity level if unknown
+
+                # Gather 9 features aligned with river
+                # ["severity_score", "asset_value", "timestamp_delta", "event_type_id", "command_risk", "numeric_anomaly", "hour_of_day", "day_of_week", "events_per_minute"]
                 vec = {
-                    "severity": float(row_dict["severity_score"] or 0),
-                    "asset_val": float(row_dict["asset_value"] or 0.5),
-                    "delta": float(fv.get("timestamp_delta", 0.0) if isinstance(fv, dict) else 0.0)
+                    "severity_score": float(row_dict["severity_score"] or 0),
+                    "asset_value": float(real_val),
+                    "timestamp_delta": float(t_delta),
+                    "event_type_id": float(fv.get("event_type_id", 0.0) if isinstance(fv, dict) else 0.0),
+                    "command_risk": float(fv.get("command_risk", 0.0) if isinstance(fv, dict) else 0.0),
+                    "numeric_anomaly": float(fv.get("numeric_anomaly", 0.0) if isinstance(fv, dict) else 0.0),
+                    "hour_of_day": round(now_dt.hour / 23.0, 4),
+                    "day_of_week": round(now_dt.weekday() / 6.0, 4),
+                    "events_per_minute": epm
                 }
                 records.append(vec)
+            
+            # --- CALCULO DE CONTAMINATION DINAMICA ---
+            n_total = len(rows)
+            # Definimos "evento peligroso" como severidad alta o con patron de ataque detectado
+            n_danger = sum(1 for r in rows if float(r["severity_score"] or 0) > 0.70 or r["pattern_hint"] != "none")
+            
+            # Tasa de contaminacion real vs limites de seguridad [0.1% - 10%]
+            calc_contamination = max(0.001, min(0.1, n_danger / n_total))
+            logger.info(f"Contaminacion calculada para {client_id}: {calc_contamination:.4f} (Danger events: {n_danger}/{n_total})")
 
         df = pd.DataFrame(records)
         df.fillna(0, inplace=True)
@@ -76,7 +134,7 @@ class ModelTrainer:
         
         model = IsolationForest(
             n_estimators=100, 
-            contamination=0.01, 
+            contamination=calc_contamination, 
             random_state=42, 
             n_jobs=-1
         )
@@ -96,12 +154,26 @@ class ModelTrainer:
         sha_path = os.path.join(version_dir, "model.sha256")
         
         scaler = StandardScaler()
-        scaler.fit(df) 
+        X_scaled = scaler.fit_transform(df) 
+        
+        # FIX F1: Holdout pseudo evaluation or honest metrics. Since data is unsupervised, we compute Silhouette (if anomalous) or just report descriptive.
+        from sklearn.metrics import silhouette_score
+        preds = model.predict(X_scaled)
+        try:
+            sil_score = float(silhouette_score(X_scaled, preds))
+        except ValueError: # Fails if all are 1 class
+            sil_score = 0.0
+
+        f1_proxy = sil_score if sil_score > 0 else 0.0
         
         artifact = {
             "model": model,
             "scaler": scaler,
-            "features": ["severity", "asset_val", "delta"],
+            "features": [
+                "severity_score", "asset_value", "timestamp_delta",
+                "event_type_id", "command_risk", "numeric_anomaly",
+                "hour_of_day", "day_of_week", "events_per_minute"
+            ],
             "trained_at": datetime.now(timezone.utc).isoformat(),
             "client_id": client_id,
         }
@@ -124,11 +196,11 @@ class ModelTrainer:
             from app.models.registry import register_model_version
             await register_model_version(
                 version=version,
-                f1_score=0.95,
+                f1_score=f1_proxy,
                 artifact_path=version_dir,
                 sha256=sha256
             )
-            logger.info(f"Modelo {version} registrado y activado en el Registry.")
+            logger.info(f"Modelo {version} registrado y activado en el Registry con proxy score.")
         except Exception as e:
             logger.error(f"Error al registrar modelo en DB: {e}")
         
@@ -139,8 +211,12 @@ class ModelTrainer:
             "client_id": client_id,
             "version": version,
             "hash_sha256": sha256,
-            "training_time_sec": round(training_time, 3),
-            "samples_processed": len(df)
+            "metrics": {
+                "n_samples": len(df),
+                "contamination": round(calc_contamination, 4),
+                "silhouette_score": round(sil_score, 4),
+                "training_time_sec": round(training_time, 3)
+            }
         }
         
         logger.info(f"Modelo reentrenado exitosamente: {result}")

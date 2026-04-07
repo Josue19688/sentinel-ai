@@ -13,12 +13,11 @@ from app.normalizer.universal import normalize
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)
-FEATURES = ["severity", "asset_val", "delta"]
-FEATURE_KEYS = {
-    "severity": "severity_score",
-    "asset_val": "asset_value",
-    "delta": "timestamp_delta",
-}
+FEATURES = [
+    "severity_score", "asset_value", "timestamp_delta",
+    "event_type_id", "command_risk", "numeric_anomaly",
+    "hour_of_day", "day_of_week", "events_per_minute"
+]
 
 _model_cache = {"model": None, "scaler": None, "version": None}
 
@@ -144,10 +143,58 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
 
     # 4. Construir vector y predecir
     import pandas as pd
-    vec = pd.DataFrame(
-        [[event.features_vector.get(FEATURE_KEYS[f], 0.0) for f in FEATURES]],
-        columns=FEATURES
-    )
+    from datetime import datetime, timezone
+    
+    now_dt = datetime.now(timezone.utc)
+    
+    # Calculate events_per_minute and last_timestamp from DB in a single query
+    epm = 0.0
+    t_delta = 1.0
+    try:
+        async with get_db_conn() as conn:
+            # Look back up to 24h for the previous event to compute delta
+            row = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 minute') as epm_count,
+                    MAX(created_at) as last_ts
+                FROM normalized_features
+                WHERE client_id = $1 AND asset_id = $2
+                  AND created_at > NOW() - INTERVAL '24 hours'
+            """, client_id, event.asset_id)
+            
+            if row:
+                # 1. Events per minute (normalized 0-1)
+                epm = round(min(1.0, row["epm_count"] / 60.0), 4)
+                
+                # 2. Timestamp delta (normalized using identical log logic as trainer)
+                if row["last_ts"]:
+                    import math
+                    # Convert last_ts to UTC if needed
+                    last_dt = row["last_ts"]
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    
+                    delta_seconds = (now_dt - last_dt).total_seconds()
+                    # Formula identity check: math.log10(delta + 1) / math.log10(3601)
+                    t_delta = round(min(1.0, math.log10(max(0, delta_seconds) + 1) / math.log10(3601)), 4)
+    except Exception as e:
+        logger.warning(f"Error fetching temporal features: {e}")
+        pass
+
+    fv = event.features_vector or {}
+    vec_dict = {
+        "severity_score": float(event.get("severity_score", 0.0)),
+        "asset_value": float(fv.get("asset_value", 0.5)),
+        "timestamp_delta": float(t_delta),
+        "event_type_id": float(fv.get("event_type_id", 0.0)),
+        "command_risk": float(fv.get("command_risk", 0.0)),
+        "numeric_anomaly": float(fv.get("numeric_anomaly", 0.0)),
+        "hour_of_day": round(now_dt.hour / 23.0, 4),
+        "day_of_week": round(now_dt.weekday() / 6.0, 4),
+        "events_per_minute": epm
+    }
+    
+    vec = pd.DataFrame([[vec_dict[f] for f in FEATURES]], columns=FEATURES)
     vec_scaled = _model_cache["scaler"].transform(vec)
     score_raw = _model_cache["model"].decision_function(vec_scaled)[0]
 

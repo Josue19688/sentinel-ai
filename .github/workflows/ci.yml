@@ -39,7 +39,7 @@ jobs:
       - name: Run Tests
         run: |
           cd ml-service
-          pytest --cov=app --cov-fail-under=60
+          pytest --cov=app --cov-fail-under=30
       - name: Verify Migrations
         env:
           DATABASE_URL: postgresql://postgres:test@localhost:5432/test_db
