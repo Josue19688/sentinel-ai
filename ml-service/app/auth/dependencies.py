@@ -20,7 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, APIKeyHea
 
 from app.auth.api_key_manager import split_api_key, verify_secret
 from app.auth.jwt_handler import decode_token
-from app.db import get_db_conn, get_redis
+from app.db import get_db_conn, get_redis, current_tenant_id_cv
 
 logger = logging.getLogger(__name__)
 
@@ -160,8 +160,10 @@ async def get_current_identity(
     Si no hay ninguno, lanza 401.
     """
     if user:
+        current_tenant_id_cv.set(user.id)
         return user
     if client:
+        current_tenant_id_cv.set(client.user_id)
         return client
     
     raise HTTPException(
@@ -198,8 +200,10 @@ def require_scope(scope: str):
         if isinstance(identity, CurrentUser):
             if identity.role == "admin":
                 return identity
-            # Analysts tienen acceso limitado si se requiere
-            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Acceso denegado para rol {identity.role}")
+            # Analysts tienen acceso de lectura por defecto a todos los endpoints read:*
+            if identity.role == "analyst" and scope.startswith("read:"):
+                return identity
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Acceso denegado para rol {identity.role} al scope {scope}")
 
         # Si es un cliente, validamos scopes estrictos
         if scope not in identity.scopes:

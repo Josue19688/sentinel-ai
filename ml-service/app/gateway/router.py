@@ -36,6 +36,7 @@ from app.calculator.quick_risk             import calculate as calculate_risk
 from app.repositories.gateway             import create_sentinel_client
 from app.repositories.asset               import find_asset_by_event
 from app.config import settings
+from app.security.sanitizer               import sanitize
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gateway", tags=["gateway"])
@@ -179,8 +180,15 @@ async def get_sandbox_report(session_id: str):
 
 # ── Endpoint principal — recibe cualquier SIEM ────────────────────────────────
 
+from pydantic import BaseModel
+
+class AnalyzePayload(BaseModel):
+    id: str | int
+    model_config = {"extra": "allow"}
+
 @router.post("/analyze")
 async def analyze(
+    payload: AnalyzePayload,
     request: Request,
     identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
 ):
@@ -193,15 +201,24 @@ async def analyze(
 
     # La autenticación ahora es manejada por app.auth.dependencies.
     # API Key gestionada por el Dashboard (sentinel-grc UI).
-    client_id    = identity.id if isinstance(identity, CurrentUser) else identity.user_id
-    client_name  = identity.name
-    sentinel_key = "session" if isinstance(identity, CurrentUser) else identity.key_id
+    # Extraer ID y nombre de forma robusta (soporta CurrentUser y CurrentApiClient)
+    if hasattr(identity, "email"): # CurrentUser
+        client_id    = identity.id
+        client_name  = identity.email
+        sentinel_key = "session"
+    else: # CurrentApiClient
+        client_id    = getattr(identity, "user_id", "unknown")
+        client_name  = getattr(identity, "name", "unknown")
+        sentinel_key = getattr(identity, "key_id", "unknown")
+
+
     
-    # 2. Recibir JSON crudo
+    # 2. Recibir JSON crudo y sanitizar contra XSS/SQLi preventivo
     try:
-        raw = await request.json()
+        raw = payload.model_dump(exclude_unset=True)
+        raw = sanitize(raw)
     except Exception:
-        raise HTTPException(400, "El body debe ser JSON válido")
+        raise HTTPException(400, "El body debe ser JSON válido o falló la sanitización.")
 
     # 3. Normalización agnóstica — sentinel_v2
     normalized = auto_normalize(raw)

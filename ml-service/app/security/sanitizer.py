@@ -27,11 +27,19 @@ MAX_PAYLOAD_BYTES  = 10_485_760 # 10 MB total
 
 # Patrones que indican intento de inyección
 _INJECTION_PATTERNS = [
-    re.compile(r'\.\./'),                         # path traversal
-    re.compile(r'<script', re.IGNORECASE),        # XSS básico
-    re.compile(r'\$\{.*\}'),                      # template injection
-    re.compile(r'__proto__', re.IGNORECASE),      # prototype pollution
+    re.compile(r'\.\./'),                                        # path traversal
+    re.compile(r'<script.*?>.*?</script>', re.IGNORECASE | re.DOTALL), # XSS completo tags
+    re.compile(r'<script', re.IGNORECASE),                       # XSS proactivo
+    re.compile(r'javascript:', re.IGNORECASE),                    # XSS uri
+    re.compile(r'on\w+\s*=', re.IGNORECASE),                      # Event handlers
+    re.compile(r'<\s*iframe', re.IGNORECASE),                    # iframes
+    re.compile(r'\$\{.*\}'),                                     # template injection
+    re.compile(r'__proto__', re.IGNORECASE),                     # prototype pollution
     re.compile(r'constructor\s*\[', re.IGNORECASE),
+    re.compile(r'UNION\s+ALL\s+SELECT', re.IGNORECASE),          # SQL Injection
+    re.compile(r'DROP\s+(TABLE|DATABASE|SCHEMA)', re.IGNORECASE),
+    re.compile(r'DELETE\s+FROM', re.IGNORECASE),
+    re.compile(r'truncate\s+(table|database)', re.IGNORECASE),
 ]
 
 

@@ -31,10 +31,6 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
     """
     full_text = f"{text} {command}".lower()
     
-    # Diagnóstico solicitado
-    logger.info(f"CLASSIFIER_INPUT primeros 300 chars: {full_text[:300]}")
-    logger.info(f"PORTSCAN_MATCH_TEST: {_matches(full_text, [r'port.scan', r'portscan', r'reconnaissance'])}")
-
     # ── 1. Ransomware / destrucción de datos ─────────────────────────────────
     if _matches(full_text, [
         r'vssadmin.delete.shadows', r'delete.shadows',

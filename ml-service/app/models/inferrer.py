@@ -97,6 +97,10 @@ class DotDict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
+import asyncio
+
+_model_lock = asyncio.Lock()
+
 async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     # 1. Compatibilidad: Gateway v2 (enriched dict) vs direct ingestion
     if "features_vector" in raw and "asset_id" in raw:
@@ -120,11 +124,13 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     current_version = _get_current_version(client_id)
 
     if _model_cache["model"] is None or _model_cache["version"] != current_version:
-        logger.info(
-            f"inferrer: recargando modelo — "
-            f"cache={_model_cache['version']} disk={current_version}"
-        )
-        _model_cache["model"], _model_cache["scaler"], _model_cache["version"] = _load_model(client_id)
+        async with _model_lock:
+            if _model_cache["model"] is None or _model_cache["version"] != current_version:
+                logger.info(
+                    f"inferrer: recargando modelo — "
+                    f"cache={_model_cache['version']} disk={current_version}"
+                )
+                _model_cache["model"], _model_cache["scaler"], _model_cache["version"] = _load_model(client_id)
 
     if _model_cache["model"] is None:
         # Fallback ISO 27005 determinístico

@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+from prometheus_fastapi_instrumentator import Instrumentator
 import time, logging
 
 from app.config import settings
@@ -22,8 +23,18 @@ from app.api.keys_router import router as keys_router
 from app.api.trainer_router import router as trainer_router
 from app.api.assets_router import router as assets_router
 
-logging.basicConfig(level=settings.LOG_LEVEL)
-logger = logging.getLogger(__name__)
+from pythonjsonlogger import jsonlogger
+
+log_handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(module)s %(funcName)s %(message)s')
+log_handler.setFormatter(formatter)
+
+logger = logging.getLogger()
+logger.setLevel(settings.LOG_LEVEL)
+for h in logger.handlers[:]:
+    logger.removeHandler(h)
+logger.addHandler(log_handler)
+
 
 
 @asynccontextmanager
@@ -55,9 +66,19 @@ app.include_router(keys_router)
 app.include_router(trainer_router)
 app.include_router(assets_router)
 
+Instrumentator().instrument(app).expose(app)
 
-@app.get("/health")
-async def health():
+
+@app.get("/health/live")
+async def health_live():
+    return {"status": "ok"}
+
+@app.get("/health/ready")
+async def health_ready(
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+):
+    if not identity:
+        raise HTTPException(401, "No auth")
     cb = await check_circuit_breaker()
     model = await get_active_model()
     return {
@@ -81,8 +102,15 @@ async def health_model(
     return await get_model_health(client_id)
 
 
+from pydantic import BaseModel
+
+class InferPayload(BaseModel):
+    id: str | int
+    model_config = {"extra": "allow"}
+
 @app.post("/infer")
 async def infer(
+    payload: InferPayload,
     request: Request,
     background_tasks: BackgroundTasks,
     identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
@@ -103,7 +131,7 @@ async def infer(
             "message": "ML Service degradado. Usando logica ISO 27005."
         })
 
-    body = await request.json()
+    body = payload.model_dump(exclude_unset=True)
 
     try:
         result = await run_inference(body, client_id)

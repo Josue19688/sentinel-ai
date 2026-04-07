@@ -1,50 +1,98 @@
-# ── POLITICA DE LISTA BLANCA (WHITELIST) ──────────────────────
-# Ignorar todo por defecto en la raíz
-/*
+# ==========================================
+# Python Generics
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
 
-# ── EXCEPCIONES: ARCHIVOS PERMITIDOS EN LA RAÍZ ──────────────
-!/README.md
-!/ml-service/
-!/docker-compose.yml
-!/.env.example
-!/.gitignore
+# Distribution / packaging
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# ── PYTHON / ML-SERVICE (IGNORAR LOCALES) ─────────────────────
-**/__pycache__/
-**/*.py[cod]
-ml-service/**/__pycache__/
-ml-service/**/*.py[cod]
-ml-service/venv/
-ml-service/.venv/
-ml-service/env/
-ml-service/ENV/
-ml-service/model_artifacts/
-ml-service/logs.txt
-ml-service/tmp_fix.py
-ml-service/pytest.ini
-ml-service/tests/
-ml-service/restore_keys.py
-ml-service/fix_admin_auth.py
-ml-service/app/fix_admin_auth.py
+# Unit test / coverage reports
+htmlcov/
+.rox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
 
-# ── ARCHIVOS DE SISTEMA E IDEs ───────────────────────────────
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-*.code-workspace
-.agent/
-.gemini/
-tmp/
-.docker/
-
-# ── VARIABLES Y SECRETOS (NUNCA SUBIR) ────────────────────────
+# Environments
 .env
-.env.local
-.env.*.local
-*.pem
-*.key
-*.crt
-*.cert
-secrets.json
-.secrets/
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Sentinel ML Project Specifics
+# ==========================================
+# Artifacts de ML
+model_artifacts/
+ml-service/model_artifacts/
+*.pkl
+*.sha256
+*_latest.txt
+
+# ==========================================
+# OS & IDEs 
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+EHthumbs_vista.db
+[Tt]humbs.db
+
+.idea/
+.vscode/
+.agent/
+.agents/
+*.swp
+*.swo
+
+# ==========================================
+# Archivos Temporales / Basura / Refactorización
+# ==========================================
+# Ignorar carpetas y reportes usados exclusivamente para planear y loggear localmente
+tmp/
+REFACTORIZACION/
+refactorizacion/
+Documentacion*necesaria/
+test_log.txt
+TESTING_REPORT.txt
+temp_roadmap.txt
+pytest_error.txt
+*.log
+*.sqlite3
+
+# ==========================================
+# Exclusiones específicas por solicitud del usuario
+# ==========================================
+simulator/
+SENTINEL_API_SPEC.md
+generate_doc.js

@@ -1,5 +1,5 @@
 from typing import Optional, List, Any
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,7 +35,6 @@ class Settings(BaseSettings):
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Any) -> list:
-        print(f"DEBUG_SENTINEL: parsing CORS_ORIGINS with value: {v}")
         if isinstance(v, str) and not v.startswith("["):
             return [i.strip() for i in v.split(",")]
         return v
@@ -54,6 +53,13 @@ class Settings(BaseSettings):
     # ── Ingestión Kafka (opcional) ───────────────────────────────────────────
     KAFKA_BROKER_URL: Optional[str] = None
     KAFKA_INGEST_TOPIC: str = "sentinel.ingest"
+
+    @model_validator(mode='after')
+    def validate_secrets(self):
+        if self.APP_ENV == "PRODUCTION":
+            if not self.SECRET_KEY or not self.JWT_SECRET_KEY:
+                raise ValueError("🚨 FATAL: SECRET_KEY y JWT_SECRET_KEY son requeridos y no pueden estar vacíos en PRODUCTION mode.")
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

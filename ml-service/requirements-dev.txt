@@ -1,0 +1,6 @@
+pytest
+pytest-asyncio
+pytest-cov
+factory_boy
+python-json-logger
+alembic

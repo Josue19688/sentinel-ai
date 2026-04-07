@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg15
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          cd ml-service
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Linting
+        run: |
+          cd ml-service
+          pip install ruff
+          ruff check app/
+      - name: Run Tests
+        run: |
+          cd ml-service
+          pytest --cov=app --cov-fail-under=60
+      - name: Verify Migrations
+        env:
+          DATABASE_URL: postgresql://postgres:test@localhost:5432/test_db
+        run: |
+          cd ml-service
+          alembic upgrade head
