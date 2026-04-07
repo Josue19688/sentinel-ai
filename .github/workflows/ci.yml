@@ -14,14 +14,20 @@ jobs:
         image: timescale/timescaledb:latest-pg15
         env:
           POSTGRES_PASSWORD: test
+          POSTGRES_USER: postgres
           POSTGRES_DB: test_db
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
       redis:
         image: redis:7-alpine
         options: >-
           --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,7 +48,8 @@ jobs:
           python -m pytest --cov=app --cov-fail-under=30
       - name: Verify Migrations
         env:
-          DATABASE_URL: postgresql://postgres:test@localhost:5432/test_db
+          DATABASE_URL: postgresql://postgres:test@127.0.0.1:5432/test_db
         run: |
           cd ml-service
+          sleep 5
           alembic upgrade head
