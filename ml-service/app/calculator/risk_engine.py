@@ -29,7 +29,6 @@ Separado de escalate_task para poder testearlo de forma independiente.
 """
 
 import logging
-from typing import Optional
 from psycopg2.extensions import connection as PgConnection
 
 logger = logging.getLogger(__name__)

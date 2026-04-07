@@ -9,7 +9,7 @@ La key completa se retorna UNA SOLA VEZ en la creación.
 Después solo es visible el prefix y el nombre.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -72,7 +72,6 @@ async def create_key(
     full_key, key_prefix, secret_raw = generate_api_key()
     secret_hash = hash_secret(secret_raw)
 
-    import json
     async with get_db_conn() as conn:
         key_id = await conn.fetchval(
             """

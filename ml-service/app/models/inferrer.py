@@ -5,7 +5,12 @@ Incluye: normalización, predicción, correlación multi-activo, circuit breaker
 FIX: cache de modelo se invalida automáticamente cuando el trainer
      escribe una nueva versión. Ya no requiere reiniciar el proceso.
 """
-import pickle, hashlib, os, time, logging, asyncio, math
+import pickle
+import hashlib
+import os
+import logging
+import asyncio
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
@@ -70,7 +75,7 @@ def _load_model(client_id: str):
         expected_hash = f.read().strip()
 
     if actual_hash != expected_hash:
-        logger.error(f"Model integrity check FAILED — possible tampering!")
+        logger.error("Model integrity check FAILED — possible tampering!")
         raise RuntimeError("Model artifact hash mismatch")
 
     artifacts = pickle.loads(content)

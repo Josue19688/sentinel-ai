@@ -5,7 +5,6 @@ Acceso a datos para recomendaciones ML.
 Responsabilidad unica: queries a la tabla ml_recommendations.
 No contiene logica de negocio ni reglas de validacion.
 """
-import json
 from app.db import get_db_conn
 
 

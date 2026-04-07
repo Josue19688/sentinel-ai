@@ -18,7 +18,9 @@ FIX: Usa un pool de conexiones compartido en lugar de abrir/cerrar
      una conexión nueva por cada evento. Esto elimina la latencia de
      ~15s causada por timeouts de DNS al conectar a ml-redis.
 """
-import json, logging, time
+import json
+import logging
+import time
 import redis.asyncio as aioredis
 from app.config import settings
 

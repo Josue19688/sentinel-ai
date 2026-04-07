@@ -1,7 +1,6 @@
 ﻿from sqlalchemy import Column, String, Boolean, Integer, DateTime, Float, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.db import Base
-import uuid
 
 class MLRecommendation(Base):
     __tablename__ = "ml_recommendations"

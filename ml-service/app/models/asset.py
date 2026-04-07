@@ -1,4 +1,4 @@
-﻿from sqlalchemy import Column, String, Boolean, Integer, DateTime, Numeric, text, Float
+﻿from sqlalchemy import Column, String, Boolean, Integer, DateTime, text, Float
 from app.db import Base
 
 class Asset(Base):

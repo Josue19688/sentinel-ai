@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from prometheus_fastapi_instrumentator import Instrumentator
-import time, logging
+import time
+import logging
 
 from app.config import settings
 from app.db import get_pool

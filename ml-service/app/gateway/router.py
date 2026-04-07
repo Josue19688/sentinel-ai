@@ -19,7 +19,10 @@ Cambios respecto a la versión anterior:
      → River ML decide si escalar vía escalate_queue
 """
 
-import time, logging, httpx, json, uuid
+import time
+import logging
+import json
+import uuid
 from fastapi import APIRouter, Depends, Request, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
@@ -30,8 +33,7 @@ from app.detection.kafka_filter import get_filter
 from app.gateway.enricher                  import enrich
 from app.gateway.correlator                import correlate
 from app.worker                            import celery
-from app.gateway.store                     import save_client_config, get_client_config
-from app.db                                import get_db_conn, get_redis
+from app.db                                import get_redis
 from app.calculator.quick_risk             import calculate as calculate_risk
 from app.repositories.gateway             import create_sentinel_client
 from app.repositories.asset               import find_asset_by_event
@@ -60,7 +62,8 @@ async def register_client(
         if field not in body:
             raise HTTPException(400, f"Campo requerido: {field}")
 
-    import secrets, hashlib
+    import secrets
+    import hashlib
     sentinel_key    = f"snl_{secrets.token_urlsafe(20)}"
     sentinel_secret = secrets.token_urlsafe(32)
     secret_salt     = secrets.token_hex(16)
@@ -295,13 +298,9 @@ async def analyze(
 
     # 8. Resultado para el Dashboard
     result       = _build_result(enriched, correlation, normalized)
-    risk_metrics = calculate_risk(enriched, asset_data=asset_data)
+    calculate_risk(enriched, asset_data=asset_data)
 
     # 8. Reenvío al GRC — DESHABILITADO (Sentinel ahora es independiente)
-    grc_response = {
-        "status":  "internal_only",
-        "message": "Detection stored internally. External GRC forwarding disabled.",
-    }
 
     latency = (time.perf_counter() - t0) * 1000
     logger.info(f"[{client_name}] {latency:.1f}ms — {result['risk_level']}")

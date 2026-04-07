@@ -8,7 +8,8 @@ Fuentes:
 - Lista local de IPs/rangos bloqueados (actualizada periódicamente)
 - Cache en Redis para no repetir consultas (TTL: 1 hora)
 """
-import logging, os, ipaddress
+import logging
+import ipaddress
 import httpx
 from app.config import settings
 
@@ -133,7 +134,8 @@ async def _get_cache(ip: str) -> dict | None:
 
 async def _set_cache(ip: str, result: dict):
     try:
-        import redis.asyncio as aioredis, json
+        import redis.asyncio as aioredis
+        import json
         r = aioredis.from_url(settings.REDIS_URL)
         await r.setex(f"ti:{ip}", 3600, json.dumps(result))
         await r.aclose()

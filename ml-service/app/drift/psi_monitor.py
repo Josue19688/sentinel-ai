@@ -11,7 +11,8 @@ Circuit Breaker — máquina de estados completa:
                 → CLOSED si la inferencia tiene éxito (close_circuit)
                 → OPEN   si la inferencia falla (record_failure)
 """
-import numpy as np, logging
+import numpy as np
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from app.db import get_db_conn

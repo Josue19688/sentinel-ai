@@ -2,7 +2,8 @@
 Registry de modelos — versiones activas y health check.
 Usa la tabla model_registry en DB para trazabilidad completa (ISO 42001).
 """
-import os, logging
+import os
+import logging
 from dataclasses import dataclass
 from typing import Optional
 from app.config import settings

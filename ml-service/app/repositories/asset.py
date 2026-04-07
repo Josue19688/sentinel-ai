@@ -7,7 +7,6 @@ Incluye lookup por hostname / ip_address / technical_id para correlacion con eve
 """
 from __future__ import annotations
 import logging
-from typing import Optional
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)

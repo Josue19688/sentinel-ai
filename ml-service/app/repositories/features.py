@@ -5,7 +5,6 @@ Acceso a datos para la tabla normalized_features.
 Responsabilidad unica: persistir eventos procesados por el pipeline ML.
 Usa psycopg2 sincrono (requerido por Celery workers que no pueden usar asyncio).
 """
-import json
 import logging
 from psycopg2.extras import execute_values
 from app.celery.db import get_sync_conn

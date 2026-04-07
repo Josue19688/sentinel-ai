@@ -29,7 +29,6 @@ Si parse_confidence < 0.4 el downstream puede decidir ser más conservador.
 """
 
 import re
-import json
 import logging
 from typing import Any
 

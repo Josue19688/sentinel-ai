@@ -1,4 +1,4 @@
-from typing import Optional, List, Any
+from typing import Optional, Any
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 

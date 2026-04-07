@@ -7,9 +7,15 @@ Se encarga de reentrenar el modelo de Isolation Forest utilizando el
 histórico de ataques normalizados para aprender patrones de comportamiento
 intrínsecos a la red (Weak Supervision y Ajuste de Drift).
 """
-import os, time, joblib, hashlib, logging, pickle, json, math
+import os
+import time
+import hashlib
+import logging
+import pickle
+import json
+import math
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Any
 
 from app.db import get_pool
@@ -17,7 +23,6 @@ from app.config import settings
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
-import numpy as np
 
 logger = logging.getLogger(__name__)
 

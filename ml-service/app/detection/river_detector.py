@@ -40,7 +40,6 @@ FIX 4 — Umbral de escalación reducido temporalmente durante burn-in
   Después del burn-in, vuelve al umbral normal.
 """
 
-import json
 import pickle
 import logging
 import hashlib

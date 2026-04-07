@@ -17,7 +17,6 @@ import redis as redis_lib
 
 from app.config                        import settings
 from app.celery.celery_app import celery
-from app.celery.db         import get_sync_conn
 from app.sandbox.engine    import run as sandbox_run
 
 logger  = logging.getLogger(__name__)

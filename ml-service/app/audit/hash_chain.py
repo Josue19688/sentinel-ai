@@ -9,7 +9,9 @@ CONCURRENCIA:
     carga concurrente. Sin este lock, dos requests simultáneos podrían leer el
     mismo previous_hash y bifurcar la cadena, invalidando verify_chain().
 """
-import hashlib, json, logging
+import hashlib
+import json
+import logging
 from app.db import get_db_conn
 
 logger = logging.getLogger(__name__)

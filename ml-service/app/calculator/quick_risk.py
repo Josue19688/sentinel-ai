@@ -18,7 +18,6 @@ Impacto CIA:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Any
 import math
 
 
