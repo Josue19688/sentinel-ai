@@ -5,7 +5,10 @@ Incluye: normalización, predicción, correlación multi-activo, circuit breaker
 FIX: cache de modelo se invalida automáticamente cuando el trainer
      escribe una nueva versión. Ya no requiere reiniciar el proceso.
 """
-import pickle, hashlib, os, time, logging, numpy as np
+import pickle, hashlib, os, time, logging, asyncio, math
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel
 from app.config import settings
@@ -20,7 +23,7 @@ FEATURES = [
 ]
 
 _model_cache = {"model": None, "scaler": None, "version": None}
-
+_model_lock = asyncio.Lock()
 
 class InferenceResult(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -96,9 +99,6 @@ class DotDict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
-import asyncio
-
-_model_lock = asyncio.Lock()
 
 async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     # 1. Compatibilidad: Gateway v2 (enriched dict) vs direct ingestion
@@ -142,9 +142,6 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
         )
 
     # 4. Construir vector y predecir
-    import pandas as pd
-    from datetime import datetime, timezone
-    
     now_dt = datetime.now(timezone.utc)
     
     # Calculate events_per_minute and last_timestamp from DB in a single query
@@ -168,7 +165,6 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
                 
                 # 2. Timestamp delta (normalized using identical log logic as trainer)
                 if row["last_ts"]:
-                    import math
                     # Convert last_ts to UTC if needed
                     last_dt = row["last_ts"]
                     if last_dt.tzinfo is None:

@@ -7,7 +7,7 @@ Se encarga de reentrenar el modelo de Isolation Forest utilizando el
 histórico de ataques normalizados para aprender patrones de comportamiento
 intrínsecos a la red (Weak Supervision y Ajuste de Drift).
 """
-import os, time, joblib, hashlib, logging, pickle
+import os, time, joblib, hashlib, logging, pickle, json, math
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any
@@ -16,6 +16,7 @@ from app.db import get_pool
 from app.config import settings
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,6 @@ class ModelTrainer:
                 logger.warning(f"Entrenamiento abortado para {client_id}: solo {len(rows)} registros (mínimo 50).")
                 return {"status": "aborted", "reason": "insufficient_data"}
 
-            from datetime import timezone
             # Temporal structures to compute delta and frequency
             last_ts = {}
             recent_events = {}
@@ -62,7 +62,6 @@ class ModelTrainer:
                 fv = row_dict.get("features_vector", {})
                 
                 if isinstance(fv, str):
-                    import json
                     try:
                         fv = json.loads(fv)
                     except:
@@ -78,7 +77,6 @@ class ModelTrainer:
                 
                 # FIX feature: timestamp_delta
                 ts_last = last_ts.get(asset_id)
-                import math
                 if ts_last is not None:
                     delta_seconds = now_ts - ts_last
                     t_delta = round(min(1.0, math.log10(delta_seconds + 1) / math.log10(3601)), 4)
@@ -102,7 +100,6 @@ class ModelTrainer:
                     real_val = epm # Fallback to activity level if unknown
 
                 # Gather 9 features aligned with river
-                # ["severity_score", "asset_value", "timestamp_delta", "event_type_id", "command_risk", "numeric_anomaly", "hour_of_day", "day_of_week", "events_per_minute"]
                 vec = {
                     "severity_score": float(row_dict["severity_score"] or 0),
                     "asset_value": float(real_val),
@@ -143,8 +140,6 @@ class ModelTrainer:
         training_time = time.time() - t0
         
         # ── 3. Versionado Inmutable (ISO 42001) ─────────────────────────────
-        # FIX: el nombre incluye client_id para que /versions y _cleanup_old_models
-        # puedan filtrar por cliente correctamente.
         version_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         version = f"{client_id}_{version_tag}"
         version_dir = os.path.join(self.artifacts_dir, version)
@@ -156,8 +151,6 @@ class ModelTrainer:
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df) 
         
-        # FIX F1: Holdout pseudo evaluation or honest metrics. Since data is unsupervised, we compute Silhouette (if anomalous) or just report descriptive.
-        from sklearn.metrics import silhouette_score
         preds = model.predict(X_scaled)
         try:
             sil_score = float(silhouette_score(X_scaled, preds))
@@ -186,7 +179,6 @@ class ModelTrainer:
             f.write(sha256)
 
         # Escribir latest.txt para que el inferrer detecte nueva versión
-        # sin depender de os.listdir en cada petición.
         latest_path = os.path.join(self.artifacts_dir, f"{client_id}_latest.txt")
         with open(latest_path, "w") as f:
             f.write(version)

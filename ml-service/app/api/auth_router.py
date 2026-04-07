@@ -2,7 +2,6 @@
 api/auth_router.py — Autenticacion de usuarios (JWT) Refactored a RSR
 """
 import logging
-import time
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from app.schemas.auth import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest
 from app.auth.dependencies import CurrentUser, require_role
