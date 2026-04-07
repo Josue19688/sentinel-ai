@@ -1,4 +1,4 @@
-name: CI
+name:CI
 
 on:
   push:
@@ -16,18 +16,23 @@ jobs:
           POSTGRES_PASSWORD: test
           POSTGRES_USER: postgres
           POSTGRES_DB: test_db
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
       redis:
         image: redis:7-alpine
+        ports:
+          - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,11 +42,6 @@ jobs:
         run: |
           cd ml-service
           pip install -r requirements.txt -r requirements-dev.txt
-#      - name: Linting
-#        run: |
-#          cd ml-service
-#          pip install ruff
-#          ruff check app/
       - name: Run Tests
         run: |
           cd ml-service
@@ -51,5 +51,6 @@ jobs:
           DATABASE_URL: postgresql://postgres:test@127.0.0.1:5432/test_db
         run: |
           cd ml-service
-          sleep 5
+          # Esperar a que Postgres esté realmente listo para aceptar conexiones TCP
+          timeout 30s bash -c 'until printf "" 2>>/dev/null >>/dev/tcp/127.0.0.1/5432; do sleep 1; done'
           alembic upgrade head
