@@ -23,9 +23,6 @@ from httpx import AsyncClient, ASGITransport
 os.environ["APP_ENV"] = "TESTING"
 os.environ["SECRET_KEY"] = "test_secret_key"
 os.environ["JWT_SECRET_KEY"] = "test_jwt_secret_key"
-os.environ["APP_ENV"] = "TESTING"
-os.environ["SECRET_KEY"] = "test_secret_key"
-os.environ["JWT_SECRET_KEY"] = "test_jwt_secret_key"
 
 from app.main import app
 

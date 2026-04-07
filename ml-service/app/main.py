@@ -56,8 +56,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 app.include_router(gateway_router)
@@ -106,7 +106,7 @@ from pydantic import BaseModel
 
 class InferPayload(BaseModel):
     id: str | int
-    model_config = {"extra": "allow"}
+    model_config = {"extra": "forbid"}
 
 @app.post("/infer")
 async def infer(

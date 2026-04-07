@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional
 
 class RegisterRequest(BaseModel):
@@ -6,10 +6,24 @@ class RegisterRequest(BaseModel):
     password: str
     role:     str = "analyst"
 
+    @field_validator('password')
+    @classmethod
+    def validate_complexity(cls, v: str) -> str:
+        if len(v) < 8 or not any(c.isupper() for c in v) or not any(c.isdigit() for c in v):
+            raise ValueError('Password debe tener min 8 chars, 1 mayuscula, 1 numero')
+        return v
+
 
 class LoginRequest(BaseModel):
     email:    EmailStr
     password: str
+
+    @field_validator('password')
+    @classmethod
+    def validate_complexity(cls, v: str) -> str:
+        if len(v) < 8 or not any(c.isupper() for c in v) or not any(c.isdigit() for c in v):
+            raise ValueError('Password debe tener min 8 chars, 1 mayuscula, 1 numero')
+        return v
 
 
 class TokenResponse(BaseModel):

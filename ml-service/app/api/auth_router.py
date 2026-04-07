@@ -29,26 +29,21 @@ import time
 from collections import defaultdict
 from fastapi import Request
 
-_login_attempts = defaultdict(list)
+from app.db import get_redis
 
-def _rate_limit_auth(request: Request):
-    ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < 60]
-    if len(_login_attempts[ip]) >= 10:
+async def _check_login_rate_limit(client_ip: str) -> None:
+    redis = await get_redis()
+    key   = f"login_rl:{client_ip}"
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, 60)
+    if count > 10:
         raise HTTPException(code=429, detail="Demasiados intentos. Intenta en 1 minuto.")
         
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    
-    # In-memory sliding window
-    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < 60]
-    if len(_login_attempts[ip]) >= 10:
-        raise HTTPException(429, "Demasiados intentos. Intenta de nuevo en 1 minuto.")
-    
-    _login_attempts[ip].append(now)
+    await _check_login_rate_limit(ip)
 
     try:
         access, refresh = await AuthService.login(body)
