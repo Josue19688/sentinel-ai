@@ -27,9 +27,11 @@ class PatternResult:
 def classify(text: str, severity_score: float = 0.0, command: str = "") -> PatternResult:
     """
     Clasifica el patrón de ataque a partir de texto libre y metadatos.
-    Orden: de más específico a más genérico para evitar falsos positivos.
+    Estrategia: Evalúa todos los posibles patrones y elige el de mayor CONFIANZA.
+    Esto evita que un patrón genérico (ej. whoami) tape uno crítico (ej. mimikatz).
     """
     full_text = f"{text} {command}".lower()
+    candidates: list[PatternResult] = []
     
     # ── 1. Ransomware / destrucción de datos ─────────────────────────────────
     if _matches(full_text, [
@@ -37,8 +39,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'multiple.file.delete', r'ransomware',
         r'wbadmin.delete', r'bcdedit.*recoveryenabled.no',
     ]):
-        return PatternResult("ransomware_activity", 0.95,
-            "Eliminación de shadow copies o actividad masiva de borrado de archivos.")
+        candidates.append(PatternResult("ransomware_activity", 0.95,
+            "Eliminación de shadow copies o actividad masiva de borrado de archivos."))
 
     # ── 2. Reverse shell / C2 ────────────────────────────────────────────────
     if _matches(full_text, [
@@ -48,8 +50,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'cobalt.strike', r'asyncrat',
         r'/bin/bash.*socket', r'4444|4445|1337',
     ]):
-        return PatternResult("c2_reverse_shell", 0.95,
-            "Comando de reverse shell o conexión a C2 detectado.")
+        candidates.append(PatternResult("c2_reverse_shell", 0.95,
+            "Comando de reverse shell o conexión a C2 detectado."))
 
     # ── 3. Persistencia (tareas, servicios, registros) ───────────────────────
     if _matches(full_text, [
@@ -58,8 +60,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'new.service', r'sc.create',
         r'crontab.*-[el]', r'\.bashrc|\.profile|\.bash_profile',
     ]):
-        return PatternResult("persistence", 0.85,
-            "Creación de tarea programada, servicio o clave de registro para persistencia.")
+        candidates.append(PatternResult("persistence", 0.85,
+            "Creación de tarea programada, servicio o clave de registro para persistencia."))
 
     # ── 4. Escalación de privilegios / agregar admin ──────────────────────────
     if _matches(full_text, [
@@ -69,8 +71,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'add_user_to_admin', r'attachuserpolicy.*administratoraccess',
         r'external_hacker', r'backdoor_user',
     ]):
-        return PatternResult("privilege_escalation", 0.9,
-            "Usuario añadido a grupo de administradores o rol de alto privilegio.")
+        candidates.append(PatternResult("privilege_escalation", 0.9,
+            "Usuario añadido a grupo de administradores o rol de alto privilegio."))
 
     # ── 5. Evasión de defensa ─────────────────────────────────────────────────
     if _matches(full_text, [
@@ -80,8 +82,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'audit.log.*cleared', r'history.-c',
         r'rm.*\/var\/log', r'disablekey',
     ]):
-        return PatternResult("defense_evasion", 0.9,
-            "Intento de desactivar defensas, borrar logs o evadir detección.")
+        candidates.append(PatternResult("defense_evasion", 0.9,
+            "Intento de desactivar defensas, borrar logs o evadir detección."))
 
     # ── 6. Credential dumping / robo de credenciales ─────────────────────────
     if _matches(full_text, [
@@ -90,8 +92,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'credential.dump', r'\/etc\/shadow',
         r'cat.\/etc\/passwd', r'hashdump',
     ]):
-        return PatternResult("credential_theft", 0.9,
-            "Volcado de credenciales o acceso a archivos de contraseñas del sistema.")
+        candidates.append(PatternResult("credential_theft", 0.9,
+            "Volcado de credenciales o acceso a archivos de contraseñas del sistema."))
 
     # ── 7. Reconocimiento / enumeración ──────────────────────────────────────
     if _matches(full_text, [
@@ -102,8 +104,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'find.*-perm.*4000', r'crontab.-l',
         r'whoami', r'sudo.-l', r'netstat.-a',
     ]):
-        return PatternResult("reconnaissance", 0.75,
-            "Actividad de reconocimiento: enumeración de recursos, usuarios o configuración.")
+        candidates.append(PatternResult("reconnaissance", 0.75,
+            "Actividad de reconocimiento: enumeración de recursos, usuarios o configuración."))
 
     # ── 8. Exfiltración de datos ──────────────────────────────────────────────
     if _matches(full_text, [
@@ -114,10 +116,10 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'delete.drive.item', r'filedeleted.*backup',
         r'operation.*filedownloaded.*analista',  # descarga masiva M365
     ]):
-        # Evitar falso positivo: "4444" en filename no es C2
-        if 'c2' not in full_text and 'nc -e' not in full_text:
-            return PatternResult("data_exfiltration", 0.8,
-                "Descarga masiva de archivos o transferencia sospechosa de datos.")
+        # Evitar falso positivo: si ya detectamos C2, el riesgo ya está cubierto con mayor score
+        if not any(c.pattern == "c2_reverse_shell" for c in candidates):
+            candidates.append(PatternResult("data_exfiltration", 0.8,
+                "Descarga masiva de archivos o transferencia sospechosa de datos."))
 
     # ── 9. Ejecución sospechosa (PowerShell, scripts) ────────────────────────
     if _matches(full_text, [
@@ -127,8 +129,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'mshta', r'regsvr32', r'rundll32',
         r'authorize_api_client.*untrusted',
     ]):
-        return PatternResult("suspicious_execution", 0.85,
-            "Ejecución sospechosa: script ofuscado, descarga en memoria o LOLBin.")
+        candidates.append(PatternResult("suspicious_execution", 0.85,
+            "Ejecución sospechosa: script ofuscado, descarga en memoria o LOLBin."))
 
     # ── 10. Ataque web (SQLi, XSS) ───────────────────────────────────────────
     if _matches(full_text, [
@@ -137,8 +139,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'\/etc\/passwd.*(403|200)', r'\/admin\/config',
         r'web.exploit',
     ]):
-        return PatternResult("web_attack", 0.85,
-            "Intento de ataque web: inyección SQL, XSS o acceso a recursos sensibles.")
+        candidates.append(PatternResult("web_attack", 0.85,
+            "Intento de ataque web: inyección SQL, XSS o acceso a recursos sensibles."))
 
     # ── 11. Fuerza bruta / autenticación fallida ──────────────────────────────
     if _matches(full_text, [
@@ -148,8 +150,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'login.failure', r'login_failure',
         r'event_4625', r'multiple.failed',
     ]):
-        return PatternResult("brute_force_attempt", 0.8,
-            "Múltiples fallos de autenticación o ataque de fuerza bruta.")
+        candidates.append(PatternResult("brute_force_attempt", 0.8,
+            "Múltiples fallos de autenticación o ataque de fuerza bruta."))
 
     # ── 12. Actividad de IoT anómala ──────────────────────────────────────────
     if _matches(full_text, [
@@ -157,8 +159,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'factory.*boiler', r'pressure.*psi',
         r'temp.*critical', r'sensor.*anomaly',
     ]):
-        return PatternResult("iot_anomaly", 0.8,
-            "Comportamiento anómalo en dispositivo IoT / sistema de control industrial.")
+        candidates.append(PatternResult("iot_anomaly", 0.8,
+            "Comportamiento anómalo en dispositivo IoT / sistema de control industrial."))
 
     # ── 12b. Acciones destructivas en Kubernetes ─────────────────────────────
     if _matches(full_text, [
@@ -167,8 +169,8 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'delete.*deployment', r'delete.*namespace',
         r'external.hacker.*delete', r'delete.*database',
     ]):
-        return PatternResult("cloud_attack", 0.85,
-            "Eliminación destructiva de recursos en clúster Kubernetes.")
+        candidates.append(PatternResult("cloud_attack", 0.85,
+            "Eliminación destructiva de recursos en clúster Kubernetes."))
 
     # ── 13. Acceso no autorizado en cloud ────────────────────────────────────
     if _matches(full_text, [
@@ -176,23 +178,26 @@ def classify(text: str, severity_score: float = 0.0, command: str = "") -> Patte
         r'putbucketpolicy.*root', r'deletedbinstance',
         r'deletebucket', r'terminateinstances',
     ]):
-        return PatternResult("cloud_attack", 0.9,
-            "Actividad destructiva o de backdoor en infraestructura cloud.")
+        candidates.append(PatternResult("cloud_attack", 0.9,
+            "Actividad destructiva o de backdoor en infraestructura cloud."))
 
     # ── 14. Rogue AP / amenaza WiFi ──────────────────────────────────────────
     if _matches(full_text, [
         r'rogue.access.point', r'evil.twin',
         r'deauth', r'deauthenticated',
     ]):
-        return PatternResult("wireless_threat", 0.8,
-            "Punto de acceso malicioso o ataque de deautenticación WiFi.")
+        candidates.append(PatternResult("wireless_threat", 0.8,
+            "Punto de acceso malicioso o ataque de deautenticación WiFi."))
 
-    # ── 15. Fallback por severidad alta ──────────────────────────────────────
-    if severity_score >= 0.8:
-        return PatternResult("high_severity_event", 0.5,
-            "Evento de alta severidad sin patrón específico identificado.")
+    # ── 15. Fallback y selección final ──────────────────────────────────────
+    if not candidates:
+        if severity_score >= 0.8:
+            return PatternResult("high_severity_event", 0.5,
+                "Evento de alta severidad sin patrón específico identificado.")
+        return PatternResult("none", 0.0, "Sin patrón de ataque reconocido.")
 
-    return PatternResult("none", 0.0, "Sin patrón de ataque reconocido.")
+    # Retornar el de mayor confianza (Best Match)
+    return max(candidates, key=lambda x: x.confidence)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

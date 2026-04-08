@@ -23,6 +23,7 @@ Schema canÃ³nico de salida (siempre presente, nunca falta una llave):
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from ..security.sanitizer   import sanitize
@@ -45,7 +46,6 @@ def normalize(raw: dict) -> dict:
         return _empty_canonical(raw, error=str(exc))
 
 
-# â”€â”€ Pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _pipeline(raw: dict) -> dict:
     # Paso 1: Sanitizar (limpieza + desempaquetado de JSON embebido)
@@ -60,20 +60,18 @@ def _pipeline(raw: dict) -> dict:
         str(extracted.get("command") or ""),
         json.dumps(clean),  # incluir el objeto completo para no perder contexto
     ]))
-    # Diagnostic log to analyze pattern:none cases
-    logger.debug(f"DEBUG_CLASSIFY_TEXT: {classify_text[:500]}...")
-
     pattern_result = classify(
         text           = classify_text,
         severity_score = extracted["severity_score"],
         command        = str(extracted.get("command") or ""),
     )
+    # Diagnostic log: Input snippet -> Detected Pattern
+    logger.debug(f"CLASSIFY: text='{classify_text[:200]}...' â†’ pattern='{pattern_result.pattern}'")
 
     # Paso 4: Ensamblar schema canÃ³nico
     return _build_canonical(raw, clean, extracted, pattern_result)
 
 
-# â”€â”€ Ensamblador â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _build_canonical(raw: dict, clean: dict, extracted: dict, pattern) -> dict:
     score      = round(extracted["severity_score"], 3)
@@ -125,8 +123,6 @@ def _build_canonical(raw: dict, clean: dict, extracted: dict, pattern) -> dict:
     }
 
 
-# â”€â”€ DetecciÃ³n de fuente por firma â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _detect_source_name(obj: dict) -> str:
     """
     Identifica el nombre de la fuente por firmas Ãºnicas.
@@ -161,19 +157,38 @@ def _detect_source_name(obj: dict) -> str:
     return "unknown"
 
 
-# â”€â”€ Helpers de conversiÃ³n â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
 def _normalize_timestamp(ts) -> str:
     if ts is None:
         return datetime.now(timezone.utc).isoformat()
     try:
-        ts_str = str(ts)
-        if ts_str.replace('.', '').isdigit():
-            epoch = int(float(ts_str))
-            # Epoch en milisegundos si > aÃ±o 2100 en segundos
-            if epoch > 4_102_444_800:
-                epoch //= 1000
-            return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+        ts_str = str(ts).strip()
+        
+        # 1. Formato Compacto (YYYYMMDDHHMMSS)
+        if len(ts_str) == 14 and ts_str.isdigit():
+            return datetime.strptime(ts_str, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).isoformat()
+
+        # 2. Manejo de Timestamps Numéricos (Epochs)
+        # Heurística de longitud:
+        # - 10 dígitos: segundos (ej: 1712598313)
+        # - 13 dígitos: milisegundos
+        # - 16 dígitos: microsegundos
+        # - 19 dígitos: nanosegundos
+        clean_ts = ts_str.split('.')[0] # Ignorar decimales para el conteo
+        if clean_ts.replace('-', '').isdigit():
+            val = int(float(ts_str))
+            l = len(str(abs(val)))
+            
+            if l >= 18:   # Nanosegundos
+                val //= 1_000_000_000
+            elif l >= 15: # Microsegundos
+                val //= 1_000_000
+            elif l >= 12: # Milisegundos
+                val //= 1000
+            # De lo contrario, se asume segundos
+            
+            return datetime.fromtimestamp(val, tz=timezone.utc).isoformat()
+
+        # 3. ISO Standard y variaciones
         return ts_str.replace("Z", "+00:00")
     except Exception:
         return datetime.now(timezone.utc).isoformat()
