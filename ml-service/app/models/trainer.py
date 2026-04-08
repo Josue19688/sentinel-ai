@@ -112,7 +112,7 @@ class ModelTrainer:
                     "event_type_id": float(fv.get("event_type_id", 0.0) if isinstance(fv, dict) else 0.0),
                     "command_risk": float(fv.get("command_risk", 0.0) if isinstance(fv, dict) else 0.0),
                     "numeric_anomaly": float(fv.get("numeric_anomaly", 0.0) if isinstance(fv, dict) else 0.0),
-                    "hour_of_day": round(now_dt.hour / 23.0, 4),
+                    "hour_of_day": round(math.sin(2 * math.pi * now_dt.hour / 24) * 0.5 + 0.5, 4),
                     "day_of_week": round(now_dt.weekday() / 6.0, 4),
                     "events_per_minute": epm
                 }
@@ -122,15 +122,15 @@ class ModelTrainer:
             # No dependemos solo de reglas (Weak Supervision), aseguramos una base de exploración.
             n_total = len(rows)
             n_danger = sum(1 for r in rows if 
-                           float(r.get("severity_score") or 0) > 0.70 or 
-                           (r.get("pattern_hint") and r.get("pattern_hint").lower() != "none"))
+                           float(r.get("severity_score") or 0) > 0.50 or 
+                           (r.get("pattern_hint") and r.get("pattern_hint").lower() not in ("none", "reconnaissance")))
             
             raw_ratio = n_danger / n_total if n_total > 0 else 0
             
             # Heurística Híbrida:
             # - Base del 1% (0.01) para descubrir "Unknown Unknowns" (Ataques no vistos por reglas)
             # - Plus dinámico basado en ataques conocidos. Cap del 10% para evitar sobre-ajuste al ruido.
-            calc_contamination = max(0.01, min(0.1, raw_ratio))
+            calc_contamination = max(0.005, min(0.1, n_danger / n_total))
             
             if raw_ratio < 0.005:
                 logger.warning(

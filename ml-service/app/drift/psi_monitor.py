@@ -97,39 +97,46 @@ async def record_failure():
 
 async def compute_psi() -> float:
     """
-    Calcula PSI comparando distribución de severity_score
-    entre la última semana y las 3 semanas anteriores.
+    Calcula PSI multidimensional comparando distribuciones de features críticos.
+    Si cualquier feature muestra drift significativo (>0.2), abre el Circuit Breaker.
     """
     async with get_db_conn() as conn:
-        recent = await conn.fetch("""
-            SELECT severity_score FROM normalized_features
-            WHERE created_at > NOW() - INTERVAL '7 days'
+        query = """
+            SELECT severity_score, 
+                   (features_vector->>'command_risk')::float as command_risk,
+                   (features_vector->>'numeric_anomaly')::float as numeric_anomaly
+            FROM normalized_features
+            WHERE created_at > $1
             LIMIT 5000
-        """)
-        baseline = await conn.fetch("""
-            SELECT severity_score FROM normalized_features
-            WHERE created_at BETWEEN NOW() - INTERVAL '28 days'
-                              AND NOW() - INTERVAL '7 days'
-            LIMIT 5000
-        """)
+        """
+        recent   = await conn.fetch(query.replace("$1", "NOW() - INTERVAL '7 days'"))
+        baseline = await conn.fetch(query.replace("$1", "NOW() - INTERVAL '28 days'") + 
+                                   " AND created_at <= NOW() - INTERVAL '7 days'")
 
     if len(recent) < 100 or len(baseline) < 100:
-        return 0.0  # datos insuficientes
+        return 0.0
 
-    r = np.array([r["severity_score"] for r in recent])
-    b = np.array([r["severity_score"] for r in baseline])
+    max_psi = 0.0
+    features_to_monitor = ["severity_score", "command_risk", "numeric_anomaly"]
 
-    bins  = np.linspace(0, 1, 11)
-    r_hist, _ = np.histogram(r, bins=bins)
-    b_hist, _ = np.histogram(b, bins=bins)
+    for feature in features_to_monitor:
+        r = np.array([float(row[feature] or 0.0) for row in recent])
+        b = np.array([float(row[feature] or 0.0) for row in baseline])
 
-    r_pct = (r_hist + 1) / (len(r) + len(bins))
-    b_pct = (b_hist + 1) / (len(b) + len(bins))
+        bins  = np.linspace(0, 1, 11)
+        r_hist, _ = np.histogram(r, bins=bins)
+        b_hist, _ = np.histogram(b, bins=bins)
 
-    psi = float(np.sum((r_pct - b_pct) * np.log(r_pct / b_pct)))
+        r_pct = (r_hist + 1) / (len(r) + len(bins))
+        b_pct = (b_hist + 1) / (len(b) + len(bins))
 
-    if psi > PSI_THRESHOLD:
-        logger.warning(f"PSI={psi:.3f} > threshold {PSI_THRESHOLD} — drift detected")
-        await open_circuit(f"PSI drift: {psi:.3f}")
+        psi = float(np.sum((r_pct - b_pct) * np.log(r_pct / b_pct)))
+        max_psi = max(max_psi, psi)
 
-    return psi
+        if psi > PSI_THRESHOLD:
+            logger.warning(f"Drift detectado en {feature}: PSI={psi:.3f} > {PSI_THRESHOLD}")
+
+    if max_psi > PSI_THRESHOLD:
+        await open_circuit(f"PSI drift multidimensional: {max_psi:.3f}")
+
+    return max_psi

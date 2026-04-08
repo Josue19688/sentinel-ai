@@ -1,4 +1,4 @@
-﻿"""
+"""
 detection/river_detector.py  [FIXED - v3]
 =======================================================
 
@@ -53,14 +53,14 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_KEY      = "sentinel:river_model_checkpoint"
 CHECKPOINT_INTERVAL = 50
-WARMUP_SAMPLES      = 100
+WARMUP_SAMPLES      = 30
 ANOMALY_THRESHOLD   = 0.30          # FIX: bajado de 0.35
 ESCALATE_THRESHOLD  = 0.38          # FIX: bajado de 0.45 — más permisivo para burn-in
 ESCALATE_THRESHOLD_MATURE = 0.45    # umbral normal después de burn-in
 BURNIN_EVENTS       = 500           # después de este umbral → usar threshold maduro
-N_TREES             = 25
+N_TREES             = 50
 HEIGHT              = 15
-WINDOW_SIZE         = 250
+WINDOW_SIZE         = 2000
 
 # Features enriquecidos — ahora incluyen contexto temporal
 FEATURE_NAMES = [
@@ -117,17 +117,24 @@ class HalfSpaceTreesDetector:
         )
 
     def score(self, event: dict) -> StreamingResult:
+        client_id      = str(event.get("client_id", "unknown"))
         asset_id       = str(event.get("asset_id", "unknown"))
+        composite_id   = f"{client_id}:{asset_id}"
+
         fv             = event.get("features_vector", {})
         danger         = float(event.get("danger_score", 0.3))
         is_destructive = danger >= 0.9
 
-        # FIX 2+3: calcular features enriquecidos antes de construir el vector
+        # FIX 2+3+9: calcular features enriquecidos aislados por cliente
         now = time.time()
-        enriched = self._enrich_features(fv, event, asset_id, now)
+        enriched = self._enrich_features(fv, event, composite_id, now)
 
-        model = self._get_or_create_model(asset_id)
-        self._samples_seen[asset_id] = self._samples_seen.get(asset_id, 0) + 1
+        model = self._get_or_create_model(composite_id)
+        self._samples_seen[composite_id] = self._samples_seen.get(composite_id, 0) + 1
+
+        # FIX 6: SCORE ANTES DE APRENDER (CRÍTICO)
+        # Obtenemos la anomalía basada en la historia previa del activo.
+        raw_score = model.score_one(enriched)
 
         if not is_destructive:
             model.learn_one(enriched)
@@ -139,18 +146,19 @@ class HalfSpaceTreesDetector:
         if self._event_count % CHECKPOINT_INTERVAL == 0:
             self._save_checkpoint()
 
-        # Warmup
-        if self._samples_seen[asset_id] < WARMUP_SAMPLES:
+        # Warmup (Carga inicial del baseline)
+        if self._samples_seen[composite_id] < WARMUP_SAMPLES:
+            # Durante warmup usamos severity_score como proxy para no estar ciegos
+            warmup_score = float(enriched.get("severity_score", 0.2))
             return StreamingResult(
-                anomaly_score   = 0.0,
-                is_anomaly      = False,
-                should_escalate = False,
+                anomaly_score   = round(warmup_score, 4),
+                is_anomaly      = warmup_score >= 0.5,
+                should_escalate = warmup_score >= 0.7,
                 learned         = learned,
-                reason          = f"Warmup ({self._samples_seen[asset_id]}/{WARMUP_SAMPLES}) {asset_id}",
+                reason          = f"Warmup Activo ({self._samples_seen[composite_id]}/{WARMUP_SAMPLES}) {asset_id} — Fallback Severity",
                 is_warmup       = True,
             )
 
-        raw_score     = model.score_one(enriched)
         anomaly_score = _sigmoid_v2(raw_score)    # FIX 1
 
         # FIX 4: umbral dinámico según burn-in
@@ -177,22 +185,20 @@ class HalfSpaceTreesDetector:
     def model_count(self) -> int:
         return len(self._models)
 
-    def reset_asset(self, asset_id: str) -> None:
-        if asset_id in self._models:
-            del self._models[asset_id]
-            self._last_event_ts.pop(asset_id, None)
-            self._recent_events.pop(asset_id, None)
-            logger.info(f"river: modelo para {asset_id} reiniciado")
+    def reset_asset(self, asset_id: str, client_id: str = "unknown") -> None:
+        composite_id = f"{client_id}:{asset_id}"
+        if composite_id in self._models:
+            del self._models[composite_id]
+            self._last_event_ts.pop(composite_id, None)
+            self._recent_events.pop(composite_id, None)
+            self._samples_seen.pop(composite_id, None)
+            logger.info(f"river: modelo para {composite_id} reiniciado")
 
     # ── Features enriquecidos ─────────────────────────────────────────────────
 
-    def _enrich_features(self, fv: dict, event: dict, asset_id: str, now: float) -> dict:
+    def _enrich_features(self, fv: dict, event: dict, composite_id: str, now: float) -> dict:
         """
-        Construye el vector de features enriquecido con contexto temporal.
-
-        Los features del normalizer (severity_score, command_risk, etc.) se
-        conservan. Se añaden features temporales calculados aquí que tienen
-        mucha más varianza y discriminación.
+        Construye el vector de features enriquecido con contexto temporal aislado.
         """
         import math
         from datetime import datetime, timezone
@@ -210,45 +216,42 @@ class HalfSpaceTreesDetector:
             except (TypeError, ValueError):
                 vector[fname] = 0.0
 
-        # FIX 2: timestamp_delta real (no el 0.0 del normalizer)
-        last_ts = self._last_event_ts.get(asset_id)
+        # FIX 2+9: timestamp_delta real aislado por composite_id
+        last_ts = self._last_event_ts.get(composite_id)
         if last_ts is not None:
             delta_seconds = now - last_ts
-            # Comprimir: 0s=0.0, 60s=0.5, 300s=0.8, 3600s=1.0
             vector["timestamp_delta"] = round(
                 min(1.0, math.log10(delta_seconds + 1) / math.log10(3601)), 4
             )
         else:
             vector["timestamp_delta"] = 1.0  # primer evento = delta máximo
-        self._last_event_ts[asset_id] = now
+        self._last_event_ts[composite_id] = now
 
         # FIX 3a: hora del evento normalizada (0-23 → 0.0-1.0)
         dt = datetime.fromtimestamp(now, tz=timezone.utc)
-        vector["hour_of_day"]  = round(dt.hour / 23.0, 4)
+        vector["hour_of_day"]  = round(math.sin(2 * math.pi * dt.hour / 24) * 0.5 + 0.5, 4)
         vector["day_of_week"]  = round(dt.weekday() / 6.0, 4)
 
-        # FIX 3b: frecuencia del asset en los últimos 60 segundos
-        bucket = self._recent_events.setdefault(asset_id, [])
+        # FIX 3b+9: frecuencia del asset aislada por composite_id
+        bucket = self._recent_events.setdefault(composite_id, [])
         bucket.append(now)
-        # Limpiar eventos fuera de la ventana de 60s
         cutoff = now - 60.0
-        self._recent_events[asset_id] = [t for t in bucket if t > cutoff]
-        events_in_window = len(self._recent_events[asset_id])
-        # Normalizar: 1 evento/min = bajo, 60+ = sospechoso
+        self._recent_events[composite_id] = [t for t in bucket if t > cutoff]
+        events_in_window = len(self._recent_events[composite_id])
         vector["events_per_minute"] = round(min(1.0, events_in_window / 60.0), 4)
 
         return vector
 
-    def _get_or_create_model(self, asset_id: str):
-        if asset_id not in self._models:
+    def _get_or_create_model(self, composite_id: str):
+        if composite_id not in self._models:
             from river.anomaly import HalfSpaceTrees
-            self._models[asset_id] = HalfSpaceTrees(
+            self._models[composite_id] = HalfSpaceTrees(
                 n_trees     = N_TREES,
                 height      = HEIGHT,
                 window_size = WINDOW_SIZE,
             )
-            logger.debug(f"river: nuevo modelo HST para {asset_id}")
-        return self._models[asset_id]
+            logger.debug(f"river: nuevo modelo HST para {composite_id}")
+        return self._models[composite_id]
 
     def _get_redis(self):
         if self._redis is None:

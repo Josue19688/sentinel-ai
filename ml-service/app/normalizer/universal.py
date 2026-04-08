@@ -114,7 +114,7 @@ def _build_canonical(raw: dict, clean: dict, extracted: dict, pattern) -> dict:
             "severity_score":   score,
             "asset_value":      0.5,        # se actualiza en enricher
             "timestamp_delta":  0.0,        # se calcula en correlator
-            "event_type_id":    abs(hash(str(extracted.get("event_name")))) % 1000 / 1000,
+            "event_type_id":    (int(hashlib.md5(str(extracted.get("event_name") or "unknown").encode()).hexdigest()[:8], 16) % 1000) / 1000.0,
             "numeric_anomaly":  _numeric_to_feature(extracted.get("numeric_value")),
             "command_risk":     _command_to_feature(extracted.get("command")),
         },

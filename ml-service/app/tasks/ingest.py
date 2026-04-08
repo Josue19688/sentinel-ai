@@ -34,6 +34,7 @@ FIX 4 — client_id correcto en persistencia (bug crítico)
 import json
 import logging
 import time
+import hashlib
 
 from app.celery.celery_app         import celery
 from app.detection.river_detector  import get_detector, StreamingResult
@@ -95,12 +96,19 @@ def process_ingest_queue() -> dict:
 
         nmap_score     = nmap_meta.get("score", 0.0)
         nmap_is_scan   = nmap_meta.get("is_scan", False)
-        combined_score = (river_score * 0.3) + (nmap_score * 0.7)
+        
+        # MEJORA 13: Pesos adaptativos contextuales
+        # Si hay datos de red detallados, combinamos ambas señales. 
+        # Si no, el peso recae totalmente en River para no diluir el score.
+        if src_ip and dst_port:
+            combined_score = (river_score * 0.4) + (nmap_score * 0.6)
+        else:
+            combined_score = river_score
 
-        # ── Lógica de escalación (FIX 2) ─────────────────────────────────
+        # ── Lógica de escalación (FIX 2.1) ───────────────────────────────
         via_a = nmap_is_scan
         via_b = (not in_warmup) and (river_score >= 0.45)
-        via_c = (not in_warmup) and (combined_score > 0.50)
+        via_c = (not in_warmup) and (combined_score > 0.55)
 
         should_escalate = via_a or via_b or via_c
 
@@ -175,19 +183,22 @@ def _drain_queue(max_items: int) -> list[dict]:
 
 
 def _to_db_record(log: dict) -> tuple:
+    event_type = str(log.get("event_type", "unknown"))
+    deterministic_id = (int(hashlib.md5(event_type.encode()).hexdigest()[:8], 16) % 1000) / 1000.0
+
     fv = log.get("features_vector")
     if not fv or not isinstance(fv, dict):
         fv = {
             "severity_score":  log.get("severity_score", 0.5),
             "asset_value":     log.get("asset_value", 0.5),
             "timestamp_delta": 0.0,
-            "event_type_id":   abs(hash(str(log.get("event_type", "unknown")))) % 1000 / 1000,
+            "event_type_id":   deterministic_id,
             "command_risk":    0.0,
             "numeric_anomaly": 0.0,
         }
 
     if "event_type_id" not in fv:
-        fv["event_type_id"] = abs(hash(str(log.get("event_type", "unknown")))) % 1000 / 1000
+        fv["event_type_id"] = deterministic_id
 
     fv["river_score"]    = log.get("river_score", 0.0)
     fv["nmap_score"]     = log.get("nmap_score", 0.0)

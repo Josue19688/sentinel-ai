@@ -152,32 +152,37 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     # Calculate events_per_minute and last_timestamp from DB in a single query
     epm = 0.0
     t_delta = 1.0
+    asset_importance = 0.5 # Default de criticidad media
     try:
         async with get_db_conn() as conn:
-            # Look back up to 24h for the previous event to compute delta
+            # Consulta atómica de features temporales y criticidad de activo
             row = await conn.fetchrow("""
                 SELECT 
-                    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 minute') as epm_count,
-                    MAX(created_at) as last_ts
-                FROM normalized_features
-                WHERE client_id = $1 AND asset_id = $2
-                  AND created_at > NOW() - INTERVAL '24 hours'
+                    (SELECT COUNT(*) FROM normalized_features WHERE client_id = $1 AND asset_id = $2 AND created_at > NOW() - INTERVAL '1 minute') as epm_count,
+                    (SELECT MAX(created_at) FROM normalized_features WHERE client_id = $1 AND asset_id = $2 AND created_at > NOW() - INTERVAL '24 hours') as last_ts,
+                    (SELECT valor_activo FROM assets WHERE client_id = $1 AND hostname = $2 LIMIT 1) as valor_activo
             """, client_id, event.asset_id)
             
             if row:
                 # 1. Events per minute (normalized 0-1)
                 epm = round(min(1.0, row["epm_count"] / 60.0), 4)
                 
-                # 2. Timestamp delta (normalized using identical log logic as trainer)
+                # 2. Timestamp delta (normalización logística)
                 if row["last_ts"]:
-                    # Convert last_ts to UTC if needed
                     last_dt = row["last_ts"]
                     if last_dt.tzinfo is None:
                         last_dt = last_dt.replace(tzinfo=timezone.utc)
                     
                     delta_seconds = (now_dt - last_dt).total_seconds()
-                    # Formula identity check: math.log10(delta + 1) / math.log10(3601)
                     t_delta = round(min(1.0, math.log10(max(0, delta_seconds) + 1) / math.log10(3601)), 4)
+
+                # 3. Importancia del Activo (dinámica GRC)
+                if row["valor_activo"]:
+                    ceiling = float(getattr(settings, "ASSET_VALUE_CEILING", 100000))
+                    asset_importance = min(float(row["valor_activo"]) / ceiling, 1.0)
+                else:
+                    # Fallback al valor que venga del features_vector si la tabla no tiene el activo
+                    asset_importance = float(fv.get("asset_value", 0.5))
     except Exception as e:
         logger.warning(f"Error fetching temporal features: {e}")
         pass
@@ -185,12 +190,12 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     fv = event.features_vector or {}
     vec_dict = {
         "severity_score": float(event.get("severity_score", 0.0)),
-        "asset_value": float(fv.get("asset_value", 0.5)),
+        "asset_value": float(asset_importance),
         "timestamp_delta": float(t_delta),
         "event_type_id": float(fv.get("event_type_id", 0.0)),
         "command_risk": float(fv.get("command_risk", 0.0)),
         "numeric_anomaly": float(fv.get("numeric_anomaly", 0.0)),
-        "hour_of_day": round(now_dt.hour / 23.0, 4),
+        "hour_of_day": round(math.sin(2 * math.pi * now_dt.hour / 24) * 0.5 + 0.5, 4),
         "day_of_week": round(now_dt.weekday() / 6.0, 4),
         "events_per_minute": epm
     }
@@ -199,10 +204,10 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     vec_scaled = _model_cache["scaler"].transform(vec)
     score_raw = _model_cache["model"].decision_function(vec_scaled)[0]
 
-    # Normalizar score a [0, 1] donde 1 = máxima anomalía
-    anomaly_score = float(1 / (1 + np.exp(score_raw)))
+    # Normalizar score a [0, 1] donde 1 = máxima anomalía (Scaling factor 20)
+    anomaly_score = float(1 / (1 + np.exp(score_raw * 20)))
     aro_suggested = anomaly_score * 12
-    confidence    = min(abs(score_raw) / 0.5, 1.0)
+    confidence    = min(abs(score_raw) / 0.15, 1.0)
 
     # 5. Detección de movimiento lateral
     lateral = await _check_lateral_movement(event, client_id)
