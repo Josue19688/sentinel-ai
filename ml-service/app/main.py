@@ -76,10 +76,8 @@ async def health_live():
 
 @app.get("/health/ready")
 async def health_ready(
-    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)],
 ):
-    if not identity:
-        raise HTTPException(401, "No auth")
     cb = await check_circuit_breaker()
     model = await get_active_model()
     return {
@@ -93,13 +91,11 @@ async def health_ready(
 
 @app.get("/health/model")
 async def health_model(
-    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)] = None,
+    identity: Annotated[CurrentUser | CurrentApiClient, Depends(get_current_identity)],
 ):
     """Estado detallado del modelo — para monitoreo y alertas."""
     from app.models.registry import get_model_health
-    client_id = None
-    if identity is not None:
-        client_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
+    client_id = identity.id if isinstance(identity, CurrentUser) else identity.user_id
     return await get_model_health(client_id)
 
 

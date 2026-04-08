@@ -106,11 +106,11 @@ async def get_db_conn():
         # Convertir a str explícitamente para el SET
         tid_str = str(tenant_id) if tenant_id else "SYSTEM"
         try:
-            await conn.execute(f"SET app.current_client_id = '{tid_str}'")
+            await conn.execute("SELECT set_config('app.current_client_id', $1, true)", tid_str)
         except asyncpg.exceptions.InterfaceError:
             # Re-intentar una vez si hay coalición de operaciones en la conexión
             await asyncio.sleep(0.01)
-            await conn.execute(f"SET app.current_client_id = '{tid_str}'")
+            await conn.execute("SELECT set_config('app.current_client_id', $1, true)", tid_str)
         yield conn
 
 

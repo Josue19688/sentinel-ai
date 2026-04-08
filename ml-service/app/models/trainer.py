@@ -69,7 +69,8 @@ class ModelTrainer:
                 if isinstance(fv, str):
                     try:
                         fv = json.loads(fv)
-                    except:
+                    except (json.JSONDecodeError, TypeError, ValueError) as e:
+                        logger.warning(f"trainer: fail parsing fv for {row_dict.get('id') or 'row'} — {e}")
                         fv = {}
                 
                 # Timestamp logic
@@ -180,14 +181,12 @@ class ModelTrainer:
         preds = model.predict(X_scaled)
         
         # [FIX] Reemplazo de Silhouette por métrica de estabilidad (ISO 42001)
-        # El silhouette_score requiere 2 clusters y no es un proxy real de F1.
         # Usamos la tasa de anomalías encontradas vs la contaminación calculada.
         n_anomalies = int(sum(1 for p in preds if p == -1))
         anomaly_rate = n_anomalies / len(preds) if len(preds) > 0 else 0
         
         # f1_proxy como medida de estabilidad (que tanto se desvió del target)
-        f1_proxy = float(max(0.0, 1.0 - abs(anomaly_rate - calc_contamination)))
-        sil_score = anomaly_rate # Para mantener compatibilidad con el JSON final
+        stability_score = float(max(0.0, 1.0 - abs(anomaly_rate - calc_contamination)))
         
         artifact = {
             "model": model,
@@ -218,7 +217,7 @@ class ModelTrainer:
             from app.models.registry import register_model_version
             await register_model_version(
                 version=version,
-                f1_score=f1_proxy,
+                f1_score=stability_score,
                 artifact_path=version_dir,
                 sha256=sha256
             )
@@ -236,7 +235,8 @@ class ModelTrainer:
             "metrics": {
                 "n_samples": len(df),
                 "contamination": round(calc_contamination, 4),
-                "silhouette_score": round(sil_score, 4),
+                "stability_score": round(stability_score, 4),
+                "anomaly_rate": round(anomaly_rate, 4),
                 "training_time_sec": round(training_time, 3)
             }
         }

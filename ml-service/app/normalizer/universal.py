@@ -61,7 +61,7 @@ def _pipeline(raw: dict) -> dict:
         json.dumps(clean),  # incluir el objeto completo para no perder contexto
     ]))
     # Diagnostic log to analyze pattern:none cases
-    logger.info(f"DEBUG_CLASSIFY_TEXT: {classify_text[:500]}...")
+    logger.debug(f"DEBUG_CLASSIFY_TEXT: {classify_text[:500]}...")
 
     pattern_result = classify(
         text           = classify_text,

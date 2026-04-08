@@ -14,7 +14,8 @@ import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
+from dataclasses import dataclass
 from pydantic import BaseModel
 from app.config import settings
 from app.normalizer.universal import normalize
@@ -27,7 +28,14 @@ FEATURES = [
     "hour_of_day", "day_of_week", "events_per_minute"
 ]
 
-_model_cache = {"model": None, "scaler": None, "version": None}
+@dataclass(frozen=True)
+class ModelArtifacts:
+    model: Any
+    scaler: Any
+    version: str
+
+# Cache multi-tenant: client_id -> ModelArtifacts
+_model_cache: dict[str, ModelArtifacts] = {}
 _model_lock = asyncio.Lock()
 
 class InferenceResult(BaseModel):
@@ -121,22 +129,28 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
             lateral_movement_detected=False, explanation_pending=False
         )
 
-    # 3. Cargar modelo con invalidación por versión
+    # 3. Cargar modelo con invalidación por versión y aislamiento multi-tenant
     # Se compara la versión en cache contra latest.txt en disco.
-    # Si el trainer escribió una versión nueva, se recarga automáticamente.
-    global _model_cache
+    # Si el trainer escribió una versión nueva para este cliente, se recarga.
     current_version = _get_current_version(client_id)
+    cache = _model_cache.get(client_id)
 
-    if _model_cache["model"] is None or _model_cache["version"] != current_version:
+    if cache is None or cache.version != current_version:
         async with _model_lock:
-            if _model_cache["model"] is None or _model_cache["version"] != current_version:
+            # Re-check dentro del lock (double-checked locking pattern)
+            cache = _model_cache.get(client_id)
+            if cache is None or cache.version != current_version:
                 logger.info(
-                    f"inferrer: recargando modelo — "
-                    f"cache={_model_cache['version']} disk={current_version}"
+                    f"inferrer: recargando modelo para {client_id} — "
+                    f"cache={cache.version if cache else 'none'} disk={current_version}"
                 )
-                _model_cache["model"], _model_cache["scaler"], _model_cache["version"] = _load_model(client_id)
+                m, s, v = _load_model(client_id)
+                if m and s and v:
+                    # Reemplazo ATÓMICO del objeto de caché
+                    _model_cache[client_id] = ModelArtifacts(model=m, scaler=s, version=v)
+                    cache = _model_cache[client_id]
 
-    if _model_cache["model"] is None:
+    if cache is None:
         # Fallback ISO 27005 determinístico
         score = event.severity_score
         return InferenceResult(
@@ -153,15 +167,17 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     epm = 0.0
     t_delta = 1.0
     asset_importance = 0.5 # Default de criticidad media
+    fv = event.features_vector or {}
     try:
         async with get_db_conn() as conn:
             # Consulta atómica de features temporales y criticidad de activo
+            asset_id = event.get("asset_id") or event.get("id", "unknown")
             row = await conn.fetchrow("""
                 SELECT 
                     (SELECT COUNT(*) FROM normalized_features WHERE client_id = $1 AND asset_id = $2 AND created_at > NOW() - INTERVAL '1 minute') as epm_count,
                     (SELECT MAX(created_at) FROM normalized_features WHERE client_id = $1 AND asset_id = $2 AND created_at > NOW() - INTERVAL '24 hours') as last_ts,
                     (SELECT valor_activo FROM assets WHERE client_id = $1 AND hostname = $2 LIMIT 1) as valor_activo
-            """, client_id, event.asset_id)
+            """, client_id, asset_id)
             
             if row:
                 # 1. Events per minute (normalized 0-1)
@@ -187,7 +203,6 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
         logger.warning(f"Error fetching temporal features: {e}")
         pass
 
-    fv = event.features_vector or {}
     vec_dict = {
         "severity_score": float(event.get("severity_score", 0.0)),
         "asset_value": float(asset_importance),
@@ -201,8 +216,8 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     }
     
     vec = pd.DataFrame([[vec_dict[f] for f in FEATURES]], columns=FEATURES)
-    vec_scaled = _model_cache["scaler"].transform(vec)
-    score_raw = _model_cache["model"].decision_function(vec_scaled)[0]
+    vec_scaled = cache.scaler.transform(vec)
+    score_raw = cache.model.decision_function(vec_scaled)[0]
 
     # Normalizar score a [0, 1] donde 1 = máxima anomalía (Scaling factor 20)
     anomaly_score = float(1 / (1 + np.exp(score_raw * 20)))
@@ -210,27 +225,50 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
     confidence    = min(abs(score_raw) / 0.15, 1.0)
 
     # 5. Detección de movimiento lateral
-    lateral = await _check_lateral_movement(event, client_id)
+    asset_id = event.get("asset_id") or event.get("id", "unknown")
+    lateral = await _check_lateral_movement(event, client_id, asset_id)
 
-    # 6. Retornar resultado
+    # 6. Persistir Recomendación (CRÍTICO para SHAP)
+    rec_id = None
+    try:
+        async with get_db_conn() as conn:
+            rec_id = await conn.fetchval("""
+                INSERT INTO ml_recommendations (
+                    client_id, asset_id, anomaly_score, aro_suggested, 
+                    confidence, model_version, model_mode, status,
+                    src_ip, pattern, event_type, lateral_movement_detected
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8, $9, $10, $11)
+                RETURNING id::text
+            """, 
+            client_id, asset_id, anomaly_score, aro_suggested, 
+            confidence, _model_cache["version"], settings.MODEL_MODE,
+            event.get("src_ip"), event.get("pattern_hint", "none"),
+            event.get("event_type", "unknown"), lateral)
+    except Exception as e:
+        logger.error(f"Error persisting recommendation in run_inference: {e}")
+
+    # 7. Retornar resultado
     return InferenceResult(
-        recommendation_id=None,
+        recommendation_id=rec_id,
         anomaly_score=anomaly_score,
         aro_suggested=aro_suggested,
         confidence=confidence,
-        model_version=_model_cache["version"],
+        model_version=cache.version,
         model_mode=settings.MODEL_MODE,
         lateral_movement_detected=lateral,
         explanation_pending=True
     )
 
 
-async def _check_lateral_movement(event, client_id: str) -> bool:
+async def _check_lateral_movement(event: dict, client_id: str, asset_id: str) -> bool:
     """
     Detecta movimiento lateral: anomalía en activo A seguida de
     SSH-success desde el mismo origen hacia activo B en < 5 min.
     """
-    if not event.src_ip or event.severity_score < 0.6:
+    src_ip = event.get("src_ip")
+    severity = float(event.get("severity_score", 0.0))
+    
+    if not src_ip or severity < 0.6:
         return False
 
     async with get_db_conn() as conn:
@@ -242,6 +280,6 @@ async def _check_lateral_movement(event, client_id: str) -> bool:
               AND event_type ILIKE '%ssh%success%'
               AND created_at > NOW() - INTERVAL '5 minutes'
             LIMIT 1
-        """, client_id, event.src_ip, event.asset_id)
+        """, client_id, src_ip, asset_id)
 
     return row is not None

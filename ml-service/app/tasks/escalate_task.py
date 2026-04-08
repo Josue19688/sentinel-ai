@@ -29,9 +29,9 @@ Cambios respecto a la versión anterior:
 """
 
 import json
-import asyncio
 import logging
 import json as _json
+from asgiref.sync import async_to_sync
 
 from app.celery.celery_app import celery
 from app.config            import settings
@@ -79,7 +79,7 @@ def process_escalate_queue() -> dict | None:
         )
 
         # ── Capa 3: IsolationForest ──────────────────────────────────────────
-        result = asyncio.run(_run_inference_safe(event, client_id))
+        result = async_to_sync(_run_inference_safe)(event, client_id)
 
         if result is None:
             logger.warning(f"escalate: run_inference retornó None para {asset_id}")

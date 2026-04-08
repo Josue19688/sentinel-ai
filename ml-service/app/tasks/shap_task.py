@@ -1,4 +1,4 @@
-﻿"""
+"""
 tasks/shap_task.py
 ==================
 Responsabilidad ÚNICA: calcular y almacenar explicaciones SHAP
@@ -28,12 +28,11 @@ from app.celery.db         import get_sync_conn, load_model_sync
 
 logger = logging.getLogger(__name__)
 
-FEATURES = ["severity", "asset_val", "delta"]
-FEATURE_KEYS = {
-    "severity": "severity_score",
-    "asset_val": "asset_value",
-    "delta": "timestamp_delta",
-}
+FEATURES = [
+    "severity_score", "asset_value", "timestamp_delta",
+    "event_type_id", "command_risk", "numeric_anomaly",
+    "hour_of_day", "day_of_week", "events_per_minute"
+]
 
 
 # ── Tarea Celery ──────────────────────────────────────────────────────────────
@@ -80,7 +79,7 @@ def _compute_and_store(recommendation_id: str) -> None:
 
         # 4. Calcular SHAP
         import pandas as pd
-        vec        = pd.DataFrame([[fv.get(FEATURE_KEYS[f], 0.0) for f in FEATURES]], columns=FEATURES)
+        vec        = pd.DataFrame([[fv.get(f, 0.0) for f in FEATURES]], columns=FEATURES)
         vec_scaled = scaler.transform(vec)
         shap_dict  = _calculate_shap(model, vec_scaled, fv)
 
@@ -126,10 +125,15 @@ def _get_features(cur, asset_id: str, anomaly_score: float) -> dict:
     # Fallback cuando no hay historial del activo
     logger.warning(f"shap: sin features_vector histórico para {asset_id} — usando fallback")
     return {
-        "severity_score":  anomaly_score,
-        "asset_value":     0.5,
-        "timestamp_delta": 300.0,
-        "event_type_id":   5.0,
+        "severity_score":   anomaly_score,
+        "asset_value":      0.5,
+        "timestamp_delta":  300.0,
+        "event_type_id":    0.5,
+        "command_risk":     0.0,
+        "numeric_anomaly":  0.0,
+        "hour_of_day":      0.5,
+        "day_of_week":      0.5,
+        "events_per_minute": 1.0,
     }
 
 
@@ -156,26 +160,30 @@ def _approximate_shap(fv: dict) -> dict:
     a su valor neutral (0.5 para scores, 300 para timestamp_delta).
     """
     return {
-        "severity":  round((fv.get("severity_score", 0.5) - 0.5) * 0.6, 4),
-        "asset_val": round((fv.get("asset_value", 0.5) - 0.5) * 0.2, 4),
-        "delta":     round(-fv.get("timestamp_delta", 300) / 10_000, 4),
+        "severity_score":  round((fv.get("severity_score", 0.5) - 0.5) * 0.6, 4),
+        "asset_value":     round((fv.get("asset_value", 0.5) - 0.5) * 0.2, 4),
+        "timestamp_delta": round(-fv.get("timestamp_delta", 300) / 10_000, 4),
+        "command_risk":    round(fv.get("command_risk", 0.0) * 0.5, 4),
     }
 
 
 def _explain_top_feature(top_feature: str, fv: dict) -> str:
     """Genera una explicación textual para la feature más influyente."""
     templates = {
-        "severity": (
+        "severity_score": (
             f"Severidad ({fv.get('severity_score', 0):.0%}) superó "
             f"el patrón histórico del activo."
         ),
-        "delta": (
+        "timestamp_delta": (
             f"Frecuencia inusual — {fv.get('timestamp_delta', 0):.0f}s "
             f"desde el evento anterior (baseline: ~300s)."
         ),
-        "asset_val": (
+        "asset_value": (
             f"Activo de alto valor ({fv.get('asset_value', 0):.0%}) "
             f"involucrado en evento anómalo."
+        ),
+        "command_risk": (
+            f"Uso de comando de alto riesgo detectado ({fv.get('command_risk', 0):.0%})."
         ),
         "event_type_id": (
             "Tipo de evento no coincide con los patrones históricos del activo."
