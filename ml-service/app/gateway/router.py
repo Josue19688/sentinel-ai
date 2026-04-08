@@ -187,7 +187,7 @@ from pydantic import BaseModel
 
 class AnalyzePayload(BaseModel):
     id: str | int
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "allow"}
 
 @router.post("/analyze")
 async def analyze(

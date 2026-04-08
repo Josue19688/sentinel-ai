@@ -117,15 +117,15 @@ async def _check_ipinfo(ip: str) -> dict:
     return {"malicious": False, "source": "none"}
 
 
+from app.db import get_redis
+import json
+
 async def _get_cache(ip: str) -> dict | None:
     """Cache en Redis — TTL 1 hora para no repetir consultas."""
     try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(settings.REDIS_URL)
+        r = await get_redis()
         val = await r.get(f"ti:{ip}")
-        await r.aclose()
         if val:
-            import json
             return json.loads(val)
     except Exception:
         pass
@@ -134,11 +134,8 @@ async def _get_cache(ip: str) -> dict | None:
 
 async def _set_cache(ip: str, result: dict):
     try:
-        import redis.asyncio as aioredis
-        import json
-        r = aioredis.from_url(settings.REDIS_URL)
+        r = await get_redis()
         await r.setex(f"ti:{ip}", 3600, json.dumps(result))
-        await r.aclose()
     except Exception:
         pass
 

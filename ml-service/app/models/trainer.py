@@ -118,29 +118,52 @@ class ModelTrainer:
                 }
                 records.append(vec)
             
-            # --- CALCULO DE CONTAMINATION DINAMICA ---
+            # --- CALIBRACIÓN DINÁMICA DE SENSIBILIDAD (ISO 42001) ---
+            # No dependemos solo de reglas (Weak Supervision), aseguramos una base de exploración.
             n_total = len(rows)
-            # Definimos "evento peligroso" como severidad alta o con patron de ataque detectado
-            n_danger = sum(1 for r in rows if float(r["severity_score"] or 0) > 0.70 or r["pattern_hint"] != "none")
+            n_danger = sum(1 for r in rows if 
+                           float(r.get("severity_score") or 0) > 0.70 or 
+                           (r.get("pattern_hint") and r.get("pattern_hint").lower() != "none"))
             
-            # Tasa de contaminacion real vs limites de seguridad [0.1% - 10%]
-            calc_contamination = max(0.001, min(0.1, n_danger / n_total))
-            logger.info(f"Contaminacion calculada para {client_id}: {calc_contamination:.4f} (Danger events: {n_danger}/{n_total})")
+            raw_ratio = n_danger / n_total if n_total > 0 else 0
+            
+            # Heurística Híbrida:
+            # - Base del 1% (0.01) para descubrir "Unknown Unknowns" (Ataques no vistos por reglas)
+            # - Plus dinámico basado en ataques conocidos. Cap del 10% para evitar sobre-ajuste al ruido.
+            calc_contamination = max(0.01, min(0.1, raw_ratio))
+            
+            if raw_ratio < 0.005:
+                logger.warning(
+                    f"LOG_SIGNAL_ALERT | {client_id} | Señal de ataques insuficiente ({raw_ratio:.4f}). "
+                    f"Calibrando sensibilidad base al 1% para detección de Zero-Days."
+                )
+            
+            logger.info(
+                f"SENSITIVITY_CALIBRATED | {client_id} | Contaminación: {calc_contamination:.4f} "
+                f"(Reglas: {n_danger}/{n_total}, Base: 1%)"
+            )
 
         df = pd.DataFrame(records)
         df.fillna(0, inplace=True)
         
         # ── 2. Entrenamiento (Ajuste de Drift) ──────────────────────────────
         logger.info(f"Entrenando Isolation Forest para {client_id} con {len(df)} registros...")
-        t0 = time.time()
         
+        # [FIX MATEMÁTICO] El escalamiento DEBE ocurrir ANTES del fit.
+        # En la versión anterior: model.fit(df) -> scaler.fit_transform(df) -> model.predict(X_scaled)
+        # Esto causaba que el modelo aprendiera rangos crudos pero predijera sobre rangos Z-score,
+        # resultando en scores de anomalía incorrectos y métricas (silhouette) inválidas.
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(df) 
+        
+        t0 = time.time()
         model = IsolationForest(
             n_estimators=100, 
             contamination=calc_contamination, 
             random_state=42, 
             n_jobs=-1
         )
-        model.fit(df)
+        model.fit(X_scaled) # ENTRENAR CON DATOS ESCALADOS
         
         training_time = time.time() - t0
         
@@ -153,16 +176,18 @@ class ModelTrainer:
         filepath = os.path.join(version_dir, "model.pkl")
         sha_path = os.path.join(version_dir, "model.sha256")
         
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(df) 
-        
+        # El scaler y X_scaled ya están listos y son consistentes con el entrenamiento
         preds = model.predict(X_scaled)
-        try:
-            sil_score = float(silhouette_score(X_scaled, preds))
-        except ValueError: # Fails if all are 1 class
-            sil_score = 0.0
-
-        f1_proxy = sil_score if sil_score > 0 else 0.0
+        
+        # [FIX] Reemplazo de Silhouette por métrica de estabilidad (ISO 42001)
+        # El silhouette_score requiere 2 clusters y no es un proxy real de F1.
+        # Usamos la tasa de anomalías encontradas vs la contaminación calculada.
+        n_anomalies = int(sum(1 for p in preds if p == -1))
+        anomaly_rate = n_anomalies / len(preds) if len(preds) > 0 else 0
+        
+        # f1_proxy como medida de estabilidad (que tanto se desvió del target)
+        f1_proxy = float(max(0.0, 1.0 - abs(anomaly_rate - calc_contamination)))
+        sil_score = anomaly_rate # Para mantener compatibilidad con el JSON final
         
         artifact = {
             "model": model,

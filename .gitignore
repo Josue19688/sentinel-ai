@@ -96,3 +96,8 @@ pytest_error.txt
 simulator/
 SENTINEL_API_SPEC.md
 generate_doc.js
+
+# Local/Temporary files
+integrationsplunk.py
+ml-service/celerybeat-schedule
+ml-service/migrations/seed_user.sql
