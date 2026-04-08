@@ -163,7 +163,8 @@ class _Collector:
 
         # ¿Parece timestamp?
         if key in _TIME_HINTS:
-            if re.match(r'\d{4}-\d{2}-\d{2}', value):
+            # ISO-8601 o formato compacto 14 dígitos
+            if re.match(r'\d{4}-\d{2}-\d{2}', value) or (len(value) == 14 and value.isdigit()):
                 self._timestamp_candidates.append((1.0, value))
 
         # ¿Parece un comando shell?
