@@ -148,6 +148,10 @@ class HalfSpaceTreesDetector:
 
         # Warmup (Carga inicial del baseline)
         if self._samples_seen[composite_id] < WARMUP_SAMPLES:
+
+            if not is_destructive:
+                model.learn_one(enriched)
+                
             # Durante warmup usamos severity_score como proxy para no estar ciegos
             warmup_score = float(enriched.get("severity_score", 0.2))
             return StreamingResult(
