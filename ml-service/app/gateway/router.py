@@ -216,6 +216,14 @@ async def analyze(
 
 
     
+    # ── [DEBUG] Logger de Ingesta Cruda ──────────────────────────────────────
+    try:
+        # Mostramos el JSON tal cual llegó, antes de ser procesado por Sentinel
+        raw_siem_data = payload.model_dump(exclude_unset=True)
+        logger.info(f"--- [RAW SIEM INCOMING] --- client={client_name} \n{json.dumps(raw_siem_data, indent=2)}")
+    except Exception as e:
+        logger.error(f"Error al loguear raw data: {e}")
+
     # 2. Recibir JSON crudo y sanitizar contra XSS/SQLi preventivo
     try:
         raw = payload.model_dump(exclude_unset=True)
@@ -234,6 +242,12 @@ async def analyze(
 
     # 5. Correlación multi-fuente (ventana 6 minutos) para obtener DELTA
     correlation = await correlate(enriched, sentinel_key)
+
+    # Inyectar info de correlacion para el Worker
+    enriched["correlation_count"] = correlation.get("count", 0)
+    enriched["correlation_pattern"] = correlation.get("pattern", "none")
+
+    logger.info(f"[CORRELATOR] pattern={correlation.get('pattern')}, count={correlation.get('count')}")
 
     # 6. Buscar activo real en Sentinel ML para obtener ASSET VALUE
     asset_data = await find_asset_by_event(
@@ -321,6 +335,7 @@ def _build_result(enriched: dict, correlation: dict, normalized: dict = None) ->
     """Traduce datos técnicos a lenguaje de analista."""
     # Prioridad 1: Correlación compleja (el viejo)
     pattern  = correlation.get("pattern", "none")
+    count    = correlation.get("count", 0)
     
     # Prioridad 2: IA del Normalizador V2 (si el viejo no detectó nada)
     if pattern == "none" and normalized:
@@ -333,6 +348,9 @@ def _build_result(enriched: dict, correlation: dict, normalized: dict = None) ->
 
     if ti_match:
         score = max(score, 0.8)
+
+    if count >=5 and pattern in ("none", "brute_force_attempt"):
+        pattern = "brute_force"
 
     if score >= 0.75 or pattern in ("lateral_movement", "brute_force_success", "c2_beacon"):
         risk_level, action = "high",   "escalate"

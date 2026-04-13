@@ -23,6 +23,7 @@ from app.api.auth_router import router as auth_router
 from app.api.keys_router import router as keys_router
 from app.api.trainer_router import router as trainer_router
 from app.api.assets_router import router as assets_router
+from app.api.dashboard_router import router as dashboard_router
 
 from pythonjsonlogger import jsonlogger
 
@@ -41,9 +42,16 @@ logger.addHandler(log_handler)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await get_pool()
-    logger.info(f"Sentinel ML Service starting — MODE: {settings.MODEL_MODE}")
+    app_env  = getattr(settings, "APP_ENV", "DEVELOPMENT")
+    model_mode = getattr(settings, "MODEL_MODE", "SHADOW")
+    logger.info(f"[SENTINEL] MODE={model_mode} | ENV={app_env} | SERVICE=ml-api")
+    if model_mode == "ACTIVE" and app_env == "DEVELOPMENT":
+        logger.warning(
+            "[SENTINEL] WARNING: MODEL_MODE=ACTIVE in DEVELOPMENT environment. "
+            "Recommendations will be written as PENDING and may affect real data."
+        )
     yield
-    logger.info("Sentinel ML Service shutting down")
+    logger.info("[SENTINEL] ML Service shutting down")
 
 
 app = FastAPI(
@@ -66,6 +74,7 @@ app.include_router(auth_router)
 app.include_router(keys_router)
 app.include_router(trainer_router)
 app.include_router(assets_router)
+app.include_router(dashboard_router)
 
 Instrumentator().instrument(app).expose(app)
 

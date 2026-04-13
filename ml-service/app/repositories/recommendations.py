@@ -1,4 +1,4 @@
-﻿"""
+"""
 repositories/recommendations.py
 ---------------------------------
 Acceso a datos para recomendaciones ML.
@@ -19,6 +19,7 @@ async def fetch_recommendations(client_id: str, status: str, limit: int) -> list
                 id::text,
                 asset_id,
                 src_ip,
+                victim_ip,
                 pattern,
                 event_type,
 
@@ -51,12 +52,24 @@ async def fetch_recommendations(client_id: str, status: str, limit: int) -> list
                 impacted_dimensions,
                 data_flags,
 
-                -- Contexto histórico / tendencias
+                -- Contexto historico / tendencias
                 attack_count_historical,
                 first_occurrence_pattern,
                 recurrence_flag,
 
-                -- Estado y revisión
+                -- Consolidacion y estado temporal del ataque
+                event_count,
+                first_seen_at::text,
+                last_seen_at::text,
+                peak_anomaly_score,
+                lateral_movement_detected,
+                (last_seen_at >= NOW() - INTERVAL '10 minutes') AS attack_still_active,
+                ROUND(
+                    EXTRACT(EPOCH FROM (COALESCE(last_seen_at, NOW()) - first_seen_at)) / 60.0,
+                    1
+                ) AS attack_duration_minutes,
+
+                -- Estado y revision
                 status,
                 shap_ready,
                 shap_values,
@@ -81,6 +94,7 @@ async def fetch_recommendation_by_id(rec_id: str, client_id: str) -> dict | None
                 id::text,
                 asset_id,
                 src_ip,
+                victim_ip,
                 pattern,
                 event_type,
                 anomaly_score,

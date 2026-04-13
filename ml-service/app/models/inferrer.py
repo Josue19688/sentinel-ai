@@ -241,7 +241,7 @@ async def run_inference(raw: dict, client_id: str) -> InferenceResult:
                 RETURNING id::text
             """, 
             client_id, asset_id, anomaly_score, aro_suggested, 
-            confidence, _model_cache["version"], settings.MODEL_MODE,
+            str(confidence), cache.version, settings.MODEL_MODE,
             event.get("src_ip"), event.get("pattern_hint", "none"),
             event.get("event_type", "unknown"), lateral)
     except Exception as e:

@@ -1,40 +1,38 @@
 """
-calculator/risk_engine.py
-==========================
-Motor de cálculo de riesgo cuantitativo ISO 27005.
+calculator/risk_engine.py  [FIXED v3 — ARO por días de ataque]
 
-Fórmulas implementadas (estándar, no inventadas):
-  EF  = Exposure Factor      → fracción del valor del activo que se pierde
-  SLE = Single Loss Expectancy = valor_activo × EF
-  ARO = Annualized Rate of Occurrence → derivado del historial real en normalized_features
-  ALE = Annualized Loss Expectancy = SLE × ARO
+DIAGNÓSTICO FINAL DEL ARO:
+  El problema no era SESSION_GAP_MINUTES. Era la unidad de medida.
 
-CIA (Confidencialidad / Integridad / Disponibilidad):
-  No entra en EF, SLE, ARO ni ALE.
-  Se usa para identificar qué dimensiones de seguridad fueron impactadas
-  y con qué criticidad para ese activo específico.
-  Resultado en 'impacted_dimensions' — contexto de impacto, no input de fórmula.
+  ISO 27005 define ARO como: número de veces por año que ocurre un incidente.
+  Un "incidente" en contexto de port scan = 1 día en que la IP atacó el activo.
 
-ARO se calcula desde normalized_features (historial real del activo):
-  - Agrupa eventos del mismo src_ip + asset_id + event_type en ventanas de
-    SESSION_GAP_MINUTES minutos → cada grupo = 1 sesión de ataque (incidente).
-  - Contar paquetes individuales como incidentes separados infla el ARO
-    de forma irreal (ej: 500 paquetes/min → ARO 8,000+).
-  - Con sesiones, 500 paquetes en 10 min = 1 incidente, que es la
-    interpretación correcta bajo ISO 27005.
-  - Si no hay historial suficiente → ARO = 1.0 con aro_confidence = 'insufficient_data'
-    (baseline conservador per ISO 27005 cuando no hay datos históricos).
+  Con SESSION_GAP=30min y eventos llegando continuamente durante horas:
+  - La misma IP no crea gap de 30min → cuenta como 1 sesión (correcto)
+  - Pero si hay 3 IPs distintas atacando en paralelo → 3 sesiones en 30min
+  - En 30 días → aro_raw = 3 * (30 / (30/365)) = ~1,000 (incorrecto)
 
-Separado de escalate_task para poder testearlo de forma independiente.
+  SOLUCIÓN: Contar DÍAS ÚNICOS con actividad, no sesiones de paquetes.
+  Si debian fue atacada 25 días de 30 observados → ARO ≈ 25/30*365 ≈ 304.
+  Con cap 365: ARO=304, SLE=7500, ALE=2,280,000 — demasiado para port scan.
+
+  El cap correcto para port_scan es 52 (semanal) porque:
+  - Un port scan BLOQUEADO por firewall tiene EF=0.15 (daño real bajo)
+  - ALE = valor_activo × EF × ARO = 50,000 × 0.15 × 52 = $390,000/año
+  - Esto es la EXPOSICIÓN MÁXIMA ANUAL esperada, no pérdida garantizada
+  - Es el número que el analista lleva a la junta para justificar inversión en FW
+
+  Para patrones de alta severidad (ransomware, C2):
+  - EF es alto (0.75-0.90), ARO típicamente bajo (1-5 veces/año)
+  - ALE = 50,000 × 0.90 × 3 = $135,000/año → número realista para junta
 """
 
 import logging
+from datetime import date, timedelta
 from psycopg2.extensions import connection as PgConnection
 
 logger = logging.getLogger(__name__)
 
-
-# ── Tablas de referencia ──────────────────────────────────────────────────────
 
 PATTERN_EF: dict[str, float] = {
     "ransomware_activity":   0.90,
@@ -55,6 +53,7 @@ PATTERN_EF: dict[str, float] = {
     "wireless_threat":       0.25,
     "reconnaissance":        0.20,
     "high_severity_event":   0.40,
+    "port_scan":             0.15,
     "none":                  0.10,
 }
 
@@ -72,6 +71,7 @@ PATTERN_CIA_IMPACT: dict[str, list[str]] = {
     "defense_evasion":       ["integridad"],
     "persistence":           ["integridad", "disponibilidad"],
     "reconnaissance":        ["confidencialidad"],
+    "port_scan":             ["disponibilidad"],
     "web_attack":            ["confidencialidad", "integridad"],
     "iot_anomaly":           ["disponibilidad", "integridad"],
     "wireless_threat":       ["confidencialidad"],
@@ -80,23 +80,39 @@ PATTERN_CIA_IMPACT: dict[str, list[str]] = {
     "none":                  [],
 }
 
-ARO_MAX_PERIOD_DAYS = 365
-ARO_MIN_PERIOD_DAYS = 30
+# ARO caps por categoría de patrón
+# Estos caps representan el máximo razonable de incidentes/año
+ARO_CAPS: dict[str, float] = {
+    "ransomware_activity":   5.0,   # ransomware exitoso ≤ 5 veces/año
+    "data_exfiltration":     12.0,  # exfil ≤ mensual
+    "c2_reverse_shell":      12.0,
+    "credential_theft":      24.0,
+    "cloud_attack":          12.0,
+    "lateral_movement":      12.0,
+    "privilege_escalation":  24.0,
+    "c2_beacon":             52.0,
+    "brute_force_success":   24.0,
+    "defense_evasion":       52.0,
+    "persistence":           52.0,
+    "suspicious_execution":  52.0,
+    "iot_anomaly":           52.0,
+    "web_attack":            52.0,
+    "brute_force_attempt":   365.0,
+    "wireless_threat":       52.0,
+    "reconnaissance":        52.0,  # reconocimiento ≤ semanal
+    "port_scan":             52.0,  # port scan ≤ semanal (bloqueado = daño bajo)
+    "high_severity_event":   52.0,
+    "none":                  52.0,
+}
 
-ARO_HIGH_CONFIDENCE_EVENTS   = 10
-ARO_HIGH_CONFIDENCE_DAYS     = 180
-ARO_MEDIUM_CONFIDENCE_EVENTS = 3
-ARO_MEDIUM_CONFIDENCE_DAYS   = 60
+ARO_MIN_PERIOD_DAYS  = 30
+ARO_MAX_PERIOD_DAYS  = 365
 
-# Ventana de sesión: eventos del mismo origen separados por menos de
-# SESSION_GAP_MINUTES minutos se consideran el mismo incidente.
-# Valor razonado: un escaneo de puertos o ataque de fuerza bruta típico
-# dura menos de 5 minutos. Dos ráfagas separadas por más de 5 min
-# se consideran incidentes distintos.
-SESSION_GAP_MINUTES = 5
+ARO_HIGH_CONFIDENCE_DAYS_MIN  = 10
+ARO_HIGH_CONFIDENCE_PERIOD    = 180
+ARO_MEDIUM_CONFIDENCE_DAYS_MIN = 3
+ARO_MEDIUM_CONFIDENCE_PERIOD   = 60
 
-
-# ── Punto de entrada principal ────────────────────────────────────────────────
 
 def calculate_risk(
     conn: PgConnection,
@@ -121,7 +137,7 @@ def calculate_risk(
         "disponibilidad":   asset_meta.get("valor_disponibilidad",   3),
     }
 
-    affected_dims      = PATTERN_CIA_IMPACT.get(pattern_key, [])
+    affected_dims       = PATTERN_CIA_IMPACT.get(pattern_key, [])
     impacted_dimensions = {
         dim: cia_snapshot[dim]
         for dim in affected_dims
@@ -134,22 +150,21 @@ def calculate_risk(
         f"risk_engine: {asset_id} pattern={pattern} "
         f"EF={ef} SLE={sle} ARO={aro_result['aro']} ALE={ale} "
         f"aro_confidence={aro_result['confidence']} "
-        f"sessions={aro_result['sample_size']} "
-        f"attack_count={history_ctx['attack_count']}"
+        f"days_with_attacks={aro_result['sample_size']}"
     )
 
     return {
-        "ef":                     ef,
-        "sle":                    sle,
-        "aro":                    aro_result["aro"],
-        "ale":                    ale,
-        "aro_sample_size":        aro_result["sample_size"],
-        "aro_period_days":        aro_result["period_days"],
-        "aro_confidence":         aro_result["confidence"],
-        "valor_activo_snapshot":  valor_activo,
+        "ef":                    ef,
+        "sle":                   sle,
+        "aro":                   aro_result["aro"],
+        "ale":                   ale,
+        "aro_sample_size":       aro_result["sample_size"],
+        "aro_period_days":       aro_result["period_days"],
+        "aro_confidence":        aro_result["confidence"],
+        "valor_activo_snapshot": valor_activo,
         "clasificacion_criticidad": asset_meta.get("clasificacion_criticidad"),
-        "cia_snapshot":           cia_snapshot,
-        "impacted_dimensions":    impacted_dimensions,
+        "cia_snapshot":          cia_snapshot,
+        "impacted_dimensions":   impacted_dimensions,
         "data_flags": {
             "pii": bool(asset_meta.get("contiene_pii", False)),
             "pci": bool(asset_meta.get("contiene_pci", False)),
@@ -162,8 +177,6 @@ def calculate_risk(
     }
 
 
-# ── ARO basado en sesiones de ataque ─────────────────────────────────────────
-
 def _calculate_aro(
     conn: PgConnection,
     client_id: str,
@@ -171,34 +184,30 @@ def _calculate_aro(
     pattern: str,
 ) -> dict:
     """
-    Calcula ARO contando SESIONES DE ATAQUE, no eventos individuales.
+    Calcula ARO contando DÍAS ÚNICOS con actividad de ataque.
 
-    Una sesión = grupo de eventos del mismo src_ip + asset_id + event_type
-    separados por menos de SESSION_GAP_MINUTES minutos entre sí.
+    ISO 27005: ARO = veces/año que ocurre el incidente.
+    Un "incidente" = 1 día calendario con actividad detectada.
 
-    Fórmula:
-        sesiones     = número de grupos de eventos agrupados por ventana temporal
-        período_días = días entre primer y último evento (capped 30-365)
-        ARO          = sesiones / (período_días / 365)
+    Ejemplo real con datos actuales:
+      debian fue atacada por port_scan durante 1 día (2026-04-11).
+      período observado = 30 días (mínimo).
+      ARO_raw = 1 / (30/365) = 12.2 veces/año
+      ARO_capped = min(12.2, 52) = 12.2 → razonable.
+      ALE = 50,000 × 0.15 × 12.2 = $91,500/año → número defendible en junta.
 
-    Ejemplo real:
-        500 paquetes bloqueados en 10 min desde el mismo IP
-        → 1 sesión (no 500 incidentes)
-        → ARO = 1 sesión / (30/365) ≈ 12 al año (razonable)
-        vs ARO anterior = 500 / (30/365) ≈ 6,000 (irreal)
-
-    Si no hay datos suficientes → ARO = 1.0, confidence = 'insufficient_data'
+    Si debian hubiera sido atacada 5 días de 30:
+      ARO_raw = 5 / (30/365) = 60.8 → cap 52 → ALE = $390,000/año.
     """
     cur = conn.cursor()
     try:
         event_hint = _pattern_to_event_hint(pattern)
 
-        # Paso 1: obtener eventos relevantes con su timestamp y src_ip
-        # Filtramos por event_type o pattern similar al actual
+        # Contar días únicos con actividad (no eventos individuales)
         cur.execute("""
             SELECT
-                src_ip,
-                created_at
+                DATE(created_at AT TIME ZONE 'UTC') AS attack_date,
+                COUNT(DISTINCT src_ip)              AS attacking_ips
             FROM normalized_features
             WHERE client_id  = %s
               AND asset_id   = %s
@@ -206,61 +215,54 @@ def _calculate_aro(
               AND (
                   event_type ILIKE %s
                   OR features_vector->>'pattern' = %s
+                  OR pattern_hint = %s
               )
-            ORDER BY src_ip, created_at
-        """, (client_id, asset_id, f"%{event_hint}%", pattern))
+            GROUP BY DATE(created_at AT TIME ZONE 'UTC')
+            ORDER BY attack_date
+        """, (client_id, asset_id, f"%{event_hint}%", pattern, pattern))
 
-        rows = cur.fetchall()
+        rows = cur.fetchall()  # [(date, n_ips), ...]
 
         if not rows:
             return _aro_insufficient()
 
-        # Paso 2: agrupar en sesiones por src_ip usando ventana temporal
-        # Algoritmo: si el gap entre dos eventos consecutivos del mismo IP
-        # supera SESSION_GAP_MINUTES → es una nueva sesión.
-        from datetime import timedelta
+        attack_dates  = [r[0] for r in rows]
+        days_attacked = len(attack_dates)
+        first_date    = attack_dates[0]
+        last_date     = attack_dates[-1]
 
-        sessions     = 0
-        prev_ip      = None
-        prev_ts      = None
-        gap          = timedelta(minutes=SESSION_GAP_MINUTES)
-        first_ts     = rows[0][1]
-        last_ts      = rows[-1][1]
-
-        for src_ip, ts in rows:
-            if src_ip != prev_ip:
-                # Nuevo IP → nueva sesión siempre
-                sessions += 1
-            elif (ts - prev_ts) > gap:
-                # Mismo IP pero gap mayor al umbral → nueva sesión
-                sessions += 1
-            # else: mismo IP dentro del gap → mismo incidente, no contar
-            prev_ip = src_ip
-            prev_ts = ts
-
-        if sessions == 0:
-            return _aro_insufficient()
-
-        # Paso 3: calcular período en días
+        # Período observado en días (mínimo 30, máximo 365)
         period_days = max(
-            int((last_ts - first_ts).days),
+            (last_date - first_date).days + 1,
             ARO_MIN_PERIOD_DAYS
         )
         period_days = min(period_days, ARO_MAX_PERIOD_DAYS)
 
-        # ARO = sesiones / fracción_del_año
-        aro        = round(sessions / (period_days / 365), 4)
-        confidence = _aro_confidence(sessions, period_days)
+        # ARO = días atacados / fracción del año observado
+        aro_raw = days_attacked / (period_days / 365)
+
+        # Aplicar cap según patrón
+        aro_cap = ARO_CAPS.get(pattern, ARO_CAPS.get("none", 52.0))
+        aro     = round(min(aro_raw, aro_cap), 4)
+
+        if aro_raw > aro_cap:
+            logger.info(
+                f"risk_engine ARO CAPPED: {asset_id} pattern={pattern} "
+                f"raw={aro_raw:.1f} → cap={aro}"
+            )
+
+        confidence = _aro_confidence(days_attacked, period_days)
 
         logger.info(
-            f"risk_engine ARO: {asset_id} — "
-            f"eventos_raw={len(rows)} sesiones={sessions} "
-            f"período={period_days}d ARO={aro} conf={confidence}"
+            f"risk_engine ARO: {asset_id} pattern={pattern} "
+            f"días_atacados={days_attacked} "
+            f"período={period_days}d "
+            f"ARO={aro} conf={confidence}"
         )
 
         return {
             "aro":         aro,
-            "sample_size": sessions,   # ahora representa sesiones, no eventos raw
+            "sample_size": days_attacked,
             "period_days": period_days,
             "confidence":  confidence,
         }
@@ -281,10 +283,10 @@ def _aro_insufficient() -> dict:
     }
 
 
-def _aro_confidence(events: int, period_days: int) -> str:
-    if events >= ARO_HIGH_CONFIDENCE_EVENTS and period_days >= ARO_HIGH_CONFIDENCE_DAYS:
+def _aro_confidence(days_attacked: int, period_days: int) -> str:
+    if days_attacked >= ARO_HIGH_CONFIDENCE_DAYS_MIN and period_days >= ARO_HIGH_CONFIDENCE_PERIOD:
         return "high"
-    if events >= ARO_MEDIUM_CONFIDENCE_EVENTS and period_days >= ARO_MEDIUM_CONFIDENCE_DAYS:
+    if days_attacked >= ARO_MEDIUM_CONFIDENCE_DAYS_MIN and period_days >= ARO_MEDIUM_CONFIDENCE_PERIOD:
         return "medium"
     return "low"
 
@@ -304,6 +306,7 @@ def _pattern_to_event_hint(pattern: str) -> str:
         "defense_evasion":       "defender",
         "persistence":           "scheduled",
         "reconnaissance":        "scan",
+        "port_scan":             "scan",
         "web_attack":            "http",
         "iot_anomaly":           "sensor",
         "wireless_threat":       "wifi",
@@ -312,28 +315,21 @@ def _pattern_to_event_hint(pattern: str) -> str:
     return hints.get(pattern, pattern.replace("_", " "))
 
 
-# ── Contexto histórico ────────────────────────────────────────────────────────
-
 def _calculate_history_context(
-    conn: PgConnection,
-    client_id: str,
-    asset_id: str,
-    pattern: str,
+    conn: PgConnection, client_id: str, asset_id: str, pattern: str,
 ) -> dict:
     cur = conn.cursor()
     try:
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM ml_recommendations
-            WHERE client_id = %s AND asset_id = %s
-        """, (client_id, asset_id))
+        cur.execute(
+            "SELECT COUNT(*) FROM ml_recommendations WHERE client_id=%s AND asset_id=%s",
+            (client_id, asset_id)
+        )
         attack_count = int(cur.fetchone()[0] or 0)
 
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM ml_recommendations
-            WHERE client_id = %s AND asset_id = %s AND pattern = %s
-        """, (client_id, asset_id, pattern))
+        cur.execute(
+            "SELECT COUNT(*) FROM ml_recommendations WHERE client_id=%s AND asset_id=%s AND pattern=%s",
+            (client_id, asset_id, pattern)
+        )
         pattern_count = int(cur.fetchone()[0] or 0)
 
         return {
@@ -341,9 +337,8 @@ def _calculate_history_context(
             "first_occurrence": pattern_count == 0,
             "recurrence":       pattern_count > 0,
         }
-
     except Exception as e:
-        logger.error(f"risk_engine: error en history_context para {asset_id} — {e}")
+        logger.error(f"risk_engine: error en history_context — {e}")
         return {"attack_count": 0, "first_occurrence": True, "recurrence": False}
     finally:
         cur.close()

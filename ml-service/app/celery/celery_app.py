@@ -27,8 +27,8 @@ celery.conf.update(
     result_serializer      = "json",
     accept_content         = ["json"],  # Rechazar cualquier otro formato
     result_expires         = 3600,
-    task_time_limit        = 60,        # Matar tarea si tarda más de 60s
-    task_soft_time_limit   = 50,        # Warning a los 50s
+    task_time_limit        = 300,       # Matar tarea si tarda más de 5 min
+    task_soft_time_limit   = 240,       # Warning a los 4 min
     worker_max_tasks_per_child = 100,   # Evitar memory leaks en workers largos
     task_acks_late         = True,      # Reconocer tarea solo al completar (resiliencia)
     worker_prefetch_multiplier = 1,     # Un mensaje a la vez por worker (fair dispatch)

@@ -1,34 +1,28 @@
 """
-tasks/ingest.py  [FIXED]
-========================
-Cambios respecto a la versión anterior:
+tasks/ingest.py  [FIXED v2]
+============================
+FIXES APLICADOS:
 
-FIX 1 — Doble filtro eliminado
-  Antes: gateway ya aplicó KafkaFilter.send() → evento entra a ingest_queue
-         LUEGO ingest.py aplicaba fltr.evaluate() otra vez → segundo filtro
-         sobre alertas ya seleccionadas por Wazuh (nivel 5+).
-  Ahora: ingest.py NO re-filtra. El evento llegó a la cola porque ya pasó.
-         KafkaFilter queda solo en el gateway, donde tiene sentido.
+FIX 1 — Sin doble registro para eventos escalados.
+         Antes: bulk_insert guardaba TODOS los eventos en normalized_features,
+         luego escalate_task procesaba los escalados → duplicados.
+         Ahora: los eventos que escalan NO van a bulk_insert.
+         escalate_task es responsable de su propia persistencia completa.
 
-FIX 2 — Forest recibe eventos independientemente de River
-  Antes: Forest solo recibía si river_score > 0.45 AND nmap_score > 0.3
-         → en warmup (primeros 100 eventos por asset), River devuelve
-           score=0.0 siempre → Forest NUNCA recibe nada durante warmup.
-  Ahora: lógica de escalación en tres vías:
-         A) Nmap determinista puro → escala siempre (no depende de ML)
-         B) River score alto (>= ESCALATE_THRESHOLD) → escala
-         C) Combined score alto (>= 0.50) → escala
-         D) Durante warmup de River: el nmap_detector cubre la brecha
+FIX 2 — raw_hash se propaga al evento antes de escalarlo.
+         escalate_task lo usa para deduplicación.
 
-FIX 3 — Visibilidad del estado de Forest
-  Añadida métrica 'forest_queue_depth' en el retorno para saber
-  cuántos eventos están esperando al IF. Si siempre es 0, el problema
-  está en process_escalate_queue, no aquí.
+FIX 3 — client_id se valida antes de procesar.
+         Si llega vacío/None se loggea como warning — el analista
+         puede ver qué fuente no está enviando el campo.
 
-FIX 4 — client_id correcto en persistencia (bug crítico)
-  Antes: _to_db_record usaba log.get("sentinel_key") → guardaba el key_id
-         de la API Key en lugar del user_id del dueño.
-  Ahora: usa log.get("client_id") que el gateway ya inyecta correctamente.
+FIX 4 — Separación clara de rutas:
+         RUTA A (escala):    → celery escalate_task (persiste en ml_recommendations
+                                y en normalized_features vía shap/history)
+         RUTA B (no escala): → bulk_insert normalized_features solamente
+
+FIX 5 — normalized_features recibe el pattern_hint correcto del evento,
+         no "none" fijo. Antes _to_db_record ignoraba correlation_pattern.
 """
 
 import json
@@ -50,7 +44,6 @@ _redis         = redis_lib.from_url(settings.REDIS_URL, decode_responses=True)
 _nmap_detector = NmapDetector()
 BATCH_SIZE     = 500
 INGEST_QUEUE   = "sentinel:ingest_queue"
-ESCALATE_QUEUE = "sentinel:escalate_queue"
 
 
 @celery.task(name="process_ingest_queue")
@@ -59,27 +52,39 @@ def process_ingest_queue() -> dict:
     Lee hasta BATCH_SIZE logs de Redis y los procesa.
 
     Pipeline corregido:
-      ingest_queue → River ML + Nmap (paralelo) → Forest si hay señal
-                                                 → PostgreSQL siempre
-
-    El KafkaFilter NO se aplica aquí. Ya fue aplicado en el gateway
-    antes de que el evento entrara a esta cola.
+      ingest_queue → River ML + Nmap (paralelo)
+                   → SI escala: celery escalate_task (NO bulk_insert)
+                   → SI NO escala: bulk_insert normalized_features
     """
     logs = _drain_queue(BATCH_SIZE)
     if not logs:
-        return {"processed": 0, "escalated": 0, "forest_queue_depth": 0}
+        return {"processed": 0, "escalated": 0, "persisted": 0}
 
-    detector   = get_detector()
-    to_persist = []
-    escalated  = 0
+    detector      = get_detector()
+    to_persist    = []   # solo los NO escalados
+    escalated     = 0
+    skipped_no_client = 0
 
     for log in logs:
-        # ── River ML (streaming, evento por evento) ───────────────────────
+        # FIX 3: Validar client_id
+        client_id = log.get("client_id") or log.get("sentinel_key")
+        if not client_id:
+            logger.warning(
+                f"ingest: evento sin client_id descartado "
+                f"asset={log.get('asset_id')} source={log.get('source')}"
+            )
+            skipped_no_client += 1
+            continue
+
+        # Asegurar que client_id esté en el log para downstream
+        log["client_id"] = client_id
+
+        # ── River ML ─────────────────────────────────────────────────────
         stream_result: StreamingResult = detector.score(log)
         river_score = stream_result.anomaly_score
         in_warmup   = stream_result.is_warmup
 
-        # ── Nmap detector (determinista, siempre activo) ──────────────────
+        # ── Nmap detector ─────────────────────────────────────────────────
         src_ip   = log.get("data", {}).get("srcip") or log.get("src_ip")
         dst_port = log.get("data", {}).get("dstport")
         try:
@@ -94,80 +99,82 @@ def process_ingest_queue() -> dict:
             except (ValueError, TypeError):
                 pass
 
-        nmap_score     = nmap_meta.get("score", 0.0)
-        nmap_is_scan   = nmap_meta.get("is_scan", False)
-        
-        # MEJORA 13: Pesos adaptativos contextuales
-        # Si hay datos de red detallados, combinamos ambas señales. 
-        # Si no, el peso recae totalmente en River para no diluir el score.
+        nmap_score   = nmap_meta.get("score", 0.0)
+        nmap_is_scan = nmap_meta.get("is_scan", False)
+
         if src_ip and dst_port:
             combined_score = (river_score * 0.4) + (nmap_score * 0.6)
         else:
             combined_score = river_score
 
-        # ── Lógica de escalación (FIX 2.1) ───────────────────────────────
+        # ── Lógica de escalación ──────────────────────────────────────────
+        corr_count   = log.get("correlation_count", 0)
+        corr_pattern = log.get("correlation_pattern", "none")
+
         via_a = nmap_is_scan
         via_b = (not in_warmup) and (river_score >= 0.45)
         via_c = (not in_warmup) and (combined_score > 0.55)
+        via_d = (corr_count >= 5) or (corr_pattern in ("brute_force", "brute_force_success"))
 
-        should_escalate = via_a or via_b or via_c
+        should_escalate = via_a or via_b or via_c or via_d
 
-        if should_escalate:
-            via_str = "+".join(filter(None, [
-                "nmap_scan" if via_a else "",
-                "river"     if via_b else "",
-                "combined"  if via_c else "",
-            ]))
-            logger.warning(
-                f"ingest: [ESCALATION] asset={log.get('asset_id')} "
-                f"via={via_str} "
-                f"river={river_score:.3f} warmup={in_warmup} "
-                f"nmap={nmap_score:.3f} scan={nmap_is_scan} "
-                f"combined={combined_score:.3f} "
-                f"ports={nmap_meta.get('unique_ports')} "
-                f"rate={nmap_meta.get('rate_per_min')}/min"
-            )
-        else:
-            logger.debug(
-                f"ingest: normal asset={log.get('asset_id')} "
-                f"river={river_score:.3f} warmup={in_warmup} "
-                f"nmap={nmap_score:.3f}"
-            )
-
-        # Anotar el evento con los scores antes de persistir
+        # Anotar scores en el evento
         log["river_score"]    = river_score
         log["nmap_score"]     = nmap_score
         log["combined_score"] = combined_score
         log["nmap_meta"]      = nmap_meta
         log["river_warmup"]   = in_warmup
 
-        # Encolar para Forest (Capa 3)
+        # FIX 2: Asegurar raw_hash presente para deduplicación downstream
+        if not log.get("raw_hash"):
+            raw_content = json.dumps({
+                "asset_id":   log.get("asset_id"),
+                "src_ip":     src_ip,
+                "event_type": log.get("event_type"),
+                "timestamp":  log.get("timestamp") or log.get("created_at"),
+            }, sort_keys=True)
+            log["raw_hash"] = hashlib.sha256(raw_content.encode()).hexdigest()
+
         if should_escalate:
-            _redis.lpush(ESCALATE_QUEUE, json.dumps(log))
-            celery.send_task("process_escalate_queue")
+            via_str = "+".join(filter(None, [
+                "nmap_scan"   if via_a else "",
+                "river"       if via_b else "",
+                "combined"    if via_c else "",
+                "correlation" if via_d else "",
+            ]))
+            logger.warning(
+                f"ingest: [ESCALATION] asset={log.get('asset_id')} "
+                f"client={client_id} via={via_str} "
+                f"river={river_score:.3f} nmap={nmap_score:.3f} "
+                f"combined={combined_score:.3f} warmup={in_warmup}"
+            )
+            # FIX 1: NO agregar a to_persist — escalate_task lo persiste
+            celery.send_task(
+                "process_escalate_queue",
+                args=[log],
+                queue="celery"
+            )
             escalated += 1
+        else:
+            # Solo los eventos normales van a normalized_features directamente
+            to_persist.append(log)
 
-        to_persist.append(log)
-
-    # Persistir todo en normalized_features (con scores anotados)
+    # Persistir eventos normales (no escalados)
     records  = [_to_db_record(log) for log in to_persist]
-    inserted = bulk_insert_features(records)
-
-    # FIX 3: reportar la profundidad de la cola de Forest
-    forest_depth = _redis.llen(ESCALATE_QUEUE)
+    inserted = bulk_insert_features(records) if records else 0
 
     metrics = {
         "processed":          len(logs),
         "persisted":          inserted,
         "escalated":          escalated,
+        "skipped_no_client":  skipped_no_client,
         "river_models":       detector.model_count(),
-        "forest_queue_depth": forest_depth,
     }
     logger.info(f"ingest: ciclo completado — {metrics}")
     return metrics
 
 
-# ── Helpers privados ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _drain_queue(max_items: int) -> list[dict]:
     logs = []
@@ -183,8 +190,15 @@ def _drain_queue(max_items: int) -> list[dict]:
 
 
 def _to_db_record(log: dict) -> tuple:
+    """
+    Construye la tupla para bulk_insert en normalized_features.
+    Solo se llama para eventos que NO escalaron.
+    FIX 5: usa correlation_pattern o pattern_hint, no "none" fijo.
+    """
     event_type = str(log.get("event_type", "unknown"))
-    deterministic_id = (int(hashlib.md5(event_type.encode()).hexdigest()[:8], 16) % 1000) / 1000.0
+    deterministic_id = (
+        int(hashlib.md5(event_type.encode()).hexdigest()[:8], 16) % 1000
+    ) / 1000.0
 
     fv = log.get("features_vector")
     if not fv or not isinstance(fv, dict):
@@ -203,10 +217,10 @@ def _to_db_record(log: dict) -> tuple:
     fv["river_score"]    = log.get("river_score", 0.0)
     fv["nmap_score"]     = log.get("nmap_score", 0.0)
     fv["combined_score"] = log.get("combined_score", 0.0)
-    fv["pattern"]        = log.get("pattern_hint", "none")
+    fv["pattern"]        = log.get("correlation_pattern") or log.get("pattern_hint", "none")
 
     return (
-        log.get("client_id", "unknown"),   # FIX 4: era "sentinel_key" (key_id). Ahora usa el user_id del dueño.
+        log.get("client_id", "unknown"),
         log.get("source", "unknown"),
         log.get("asset_id", "unknown"),
         log.get("timestamp") or log.get("created_at"),
@@ -215,5 +229,6 @@ def _to_db_record(log: dict) -> tuple:
         log.get("event_type", "unknown"),
         log.get("src_ip"),
         json.dumps(fv),
+        log.get("correlation_pattern") or log.get("pattern_hint", "none"),  # FIX 5
         log.get("raw_hash"),
     )

@@ -83,6 +83,7 @@ def _build_canonical(raw: dict, clean: dict, extracted: dict, pattern) -> dict:
         "source":             _detect_source_name(clean),
         "asset_id":           asset_id,
         "src_ip":             extracted["src_ip"],
+        "victim_ip":          extracted.get("victim_ip"),
         "external_event_id":  _make_id(raw),
 
         # ClasificaciÃ³n
@@ -238,7 +239,7 @@ def _command_to_feature(command: str | None) -> float:
 def _empty_canonical(raw: dict, error: str = "") -> dict:
     """Schema mÃ­nimo seguro cuando el pipeline falla completamente."""
     return {
-        "source": "error", "asset_id": "unknown", "src_ip": None,
+        "source": "error", "asset_id": "unknown", "src_ip": None, "victim_ip": None,
         "external_event_id": _make_id(raw),
         "severity": "low", "severity_score": 0.1,
         "event_type": "parse_error", "pattern_hint": "none",

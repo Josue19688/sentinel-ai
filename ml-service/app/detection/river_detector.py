@@ -43,16 +43,21 @@ FIX 4 — Umbral de escalación reducido temporalmente durante burn-in
 import pickle
 import logging
 import hashlib
+import hmac
 import time
 from dataclasses import dataclass
 from typing      import Optional
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
+VERSION_KEY         = "sentinel:river_model_version"
+SYNC_INTERVAL_SEC   = 60            # Verificar versión cada 60 segundos
 CHECKPOINT_KEY      = "sentinel:river_model_checkpoint"
-CHECKPOINT_INTERVAL = 50
+CHECKPOINT_INTERVAL = 1000
 WARMUP_SAMPLES      = 30
 ANOMALY_THRESHOLD   = 0.30          # FIX: bajado de 0.35
 ESCALATE_THRESHOLD  = 0.38          # FIX: bajado de 0.45 — más permisivo para burn-in
@@ -110,6 +115,10 @@ class HalfSpaceTreesDetector:
         # FIX 3: ventana de frecuencia por asset (timestamps recientes)
         self._recent_events: dict[str, list[float]] = {}
 
+        # Sincronización multi-worker
+        self._local_version: int   = 0
+        self._last_sync_check: float = 0.0
+
         self._load_checkpoint()
         logger.info(
             f"river: HalfSpaceTreesDetector v3 iniciado — "
@@ -117,6 +126,9 @@ class HalfSpaceTreesDetector:
         )
 
     def score(self, event: dict) -> StreamingResult:
+        # 0. Sincronizar con otros workers si hay una versión más reciente
+        self._check_for_updates()
+
         client_id      = str(event.get("client_id", "unknown"))
         asset_id       = str(event.get("asset_id", "unknown"))
         composite_id   = f"{client_id}:{asset_id}"
@@ -260,9 +272,27 @@ class HalfSpaceTreesDetector:
     def _get_redis(self):
         if self._redis is None:
             import redis as redis_lib
-            from app.config import settings
-            self._redis = redis_lib.from_url(settings.REDIS_URL)
+            self._redis = redis_lib.from_url(settings.REDIS_URL, decode_responses=False)
         return self._redis
+
+    def _check_for_updates(self) -> None:
+        """Verifica si otro worker ha subido un checkpoint más reciente."""
+        now = time.time()
+        if now - self._last_sync_check < SYNC_INTERVAL_SEC:
+            return
+            
+        self._last_sync_check = now
+        try:
+            r = self._get_redis()
+            # Usar una conexión que sí decodifique para la versión (str/int)
+            v_remote = r.get(VERSION_KEY)
+            v_remote = int(v_remote) if v_remote else 0
+            
+            if v_remote > self._local_version:
+                logger.info(f"river: detectada nueva versión {v_remote} en Redis (local={self._local_version}) — recargando...")
+                self._load_checkpoint()
+        except Exception as e:
+            logger.error(f"river: error verificando actualizaciones — {e}")
 
     def _save_checkpoint(self) -> None:
         try:
@@ -272,14 +302,28 @@ class HalfSpaceTreesDetector:
                 "last_event_ts":  self._last_event_ts,
                 "event_count":    self._event_count,
             })
-            sha = hashlib.sha256(payload).hexdigest()
-            self._get_redis().hset(CHECKPOINT_KEY, mapping={
+            
+            # MLSecOps: Firma HMAC-SHA256 para prevenir RCE por inyección de pickles
+            signature = hmac.new(
+                settings.SECRET_KEY.encode(),
+                payload,
+                hashlib.sha256
+            ).hexdigest()
+
+            r = self._get_redis()
+            r.hset(CHECKPOINT_KEY, mapping={
                 "v3_data": payload,
-                "sha256":  sha,
+                "hmac_sig":  signature,
                 "event_count": str(self._event_count),
             })
+            
+            # Incrementar versión global de forma atómica
+            new_v = r.incr(VERSION_KEY)
+            self._local_version = new_v
+            self._last_sync_check = time.time()
+
             logger.info(
-                f"river: checkpoint v3 guardado — "
+                f"river: checkpoint v{new_v} guardado y firmado — "
                 f"{len(self._models)} modelos, {self._event_count} eventos"
             )
         except Exception as e:
@@ -299,12 +343,18 @@ class HalfSpaceTreesDetector:
                 logger.info("river: checkpoint formato antiguo — reiniciando")
                 return
 
-            payload    = data[payload_key]
-            stored_sha = data.get(b"sha256", b"").decode()
-            actual_sha = hashlib.sha256(payload).hexdigest()
+            payload   = data[payload_key]
+            stored_sig = data.get(b"hmac_sig", b"").decode()
+            
+            # MLSecOps: Verificar integridad y autenticidad antes de des-serializar
+            expected_sig = hmac.new(
+                settings.SECRET_KEY.encode(),
+                payload,
+                hashlib.sha256
+            ).hexdigest()
 
-            if actual_sha != stored_sha:
-                logger.error("river: checkpoint SHA-256 inválido — reiniciando")
+            if not hmac.compare_digest(stored_sig, expected_sig):
+                logger.error("river: FIRMA HMAC INVÁLIDA (Posible manipulación) — checkpoint descartado")
                 return
 
             restored = pickle.loads(payload)
@@ -318,13 +368,16 @@ class HalfSpaceTreesDetector:
             else:
                 # Formato v2 legacy: solo modelos
                 self._models = restored
-                self._samples_seen = pickle.loads(
-                    data.get(b"samples_seen", pickle.dumps({}))
-                )
+                self._samples_seen = restored.get("samples_seen", {})
                 self._event_count = int(data.get(b"event_count", b"0"))
 
+            # Actualizar versión local tras carga exitosa
+            v_remote = r.get(VERSION_KEY)
+            self._local_version = int(v_remote) if v_remote else 0
+            self._last_sync_check = time.time()
+
             logger.info(
-                f"river: checkpoint recuperado — "
+                f"river: checkpoint v{self._local_version} recuperado con éxito — "
                 f"{len(self._models)} modelos, {self._event_count} eventos"
             )
         except Exception as e:
